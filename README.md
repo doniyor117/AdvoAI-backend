@@ -51,3 +51,5 @@ project_root/
 ├── requirements.txt             # Dependencies (pdfplumber, chromadb, torch)
 └── README.md                    # Documentation
 ```
+
+### Basira: (Arabic) "Insight" or "Inner Vision."

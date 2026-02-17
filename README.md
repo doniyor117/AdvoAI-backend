@@ -1,5 +1,6 @@
 ## Basira AI - Legal Chatbot with RAG
 
+```
 project_root/
 │
 ├── data/                        # YOUR RAW FUEL
@@ -49,3 +50,4 @@ project_root/
 ├── main.py                      # The entry point to run the CLI bot
 ├── requirements.txt             # Dependencies (pdfplumber, chromadb, torch)
 └── README.md                    # Documentation
+```

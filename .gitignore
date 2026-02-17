@@ -1,3 +1,14 @@
+# Ignore raw data
+data/raw_pdfs/*
+data/processed_markdown/*
+
+# Ignore environment variables (security!)
+.env
+venv/
+__pycache__/
+*.pkl
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

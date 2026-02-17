@@ -1,55 +1,49 @@
 ## Basira AI - Legal Chatbot with RAG
 
 ```
-project_root/
+project_basira/
 │
-├── data/                        # YOUR RAW FUEL
-│   ├── raw_pdfs/                # Original PDF files (Legal/Car docs)
-│   ├── processed_markdown/      # Cleaned text files (verified by human)
-│   └── golden_dataset.csv       # The 50 Q&A pairs for validation
+├── .env                         # Secrets! >> cp from .env.example
+├── .env.example                 # .env file variables structure
+├── .gitignore                   # Ignores data/ and .env
+├── requirements.txt             # Deps: pdfplumber, psycopg2-binary, pgvector, torch
+├── config.py                    # (+) Central place for settings (CHUNK_SIZE, MODEL_NAME)
 │
-├── storage/                     # YOUR PERSISTENT MEMORY
-│   ├── chromadb_store/          # Local Vector DB files (Do not touch manually)
-│   └── bm25_index.pkl           # Sparse vector index (saved as a pickle file)
+├── data/                        
+│   ├── raw_pdfs/                # Local PDF storage
+│   └── golden_dataset.csv       # (+) For testing your bot later
+│   
+├── notebooks/                   # (+) Your experimental lab
+│   └── 01_pdf_test.ipynb        # Test pdfplumber here before putting it in src/
 │
-├── src/                         # THE SOURCE CODE
-│   ├── ingestion/               # STEP 1: READING & CLEANING
+├── src/
+│   ├── ingestion/               # PHASE 1: READ
 │   │   ├── __init__.py
-│   │   ├── pdf_parser.py        # Uses 'pdfplumber' to extract text & tables
-│   │   ├── ocr_engine.py        # Uses 'pytesseract' for scanned docs
-│   │   └── cleaner.py           # Regex rules to remove headers/footers
+│   │   ├── pdf_parser.py        # Class: PDFProcessor
+│   │   └── cleaner.py           # Funcs: regex cleaning
 │   │
-│   ├── preprocessing/           # STEP 2: CHUNKING
+│   ├── database/                # PHASE 2: STORE
 │   │   ├── __init__.py
-│   │   ├── window_chunker.py    # IMPL: Sentence Window Retrieval (Sentence + 3 neighbors)
-│   │   └── semantic_chunker.py  # IMPL: Splitting by cosine similarity (Advanced)
+│   │   ├── schema.sql           # SQL: CREATE TABLE ...
+│   │   └── neon_client.py       # Class: DatabaseManager (Handling connection & queries)
 │   │
-│   ├── models/                  # STEP 3: THE BRAINS
+│   ├── preprocessing/           # PHASE 3: CHUNK
 │   │   ├── __init__.py
-│   │   ├── embedder.py          # Wrapper for 'BGE-M3' (handles Matryoshka slicing)
-│   │   ├── reranker.py          # Wrapper for 'bge-reranker-v2-m3'
-│   │   └── llm_client.py        # Wrapper for 'Ollama' API (Llama 3)
+│   │   └── chunker.py           # Funcs: window_chunker (Sentence + Neighbors)
 │   │
-│   ├── retrieval/               # STEP 4: SEARCH LOGIC
+│   ├── models/                  # PHASE 4: INTELLIGENCE
 │   │   ├── __init__.py
-│   │   ├── vector_search.py     # Connects to ChromaDB/FAISS
-│   │   ├── keyword_search.py    # IMPL: BM25 algorithm (Sparse Vectors)
-│   │   └── hybrid_engine.py     # IMPL: Combines Vector + Keyword results (RRF)
+│   │   ├── embedder.py          # Class: EmbeddingModel (BGE-M3)
+│   │   ├── reranker.py          # (+) Class: CrossEncoder (The Quality Control)
+│   │   └── llm_client.py        # Class: Google AI Studio (Gemini 2.5 flash) (it is cheap and have context caching)
 │   │
-│   └── evaluation/              # STEP 5: METRICS
-│       ├── __init__.py
-│       ├── metrics.py           # IMPL: Hit Rate, MRR calculation
-│       └── evaluator.py         # Runs the pipeline against 'golden_dataset.csv'
+│   └── app/                     # (+) Organize the app logic
+│       └── chat.py              # The CLI Chat interface
 │
-├── notebooks/                   # YOUR EXPERIMENTS (The "From Scratch" Lab)
-│   ├── 01_tfidf_from_scratch.ipynb  # You building TF-IDF with NumPy
-│   ├── 02_chunking_visualizer.ipynb # Visualizing window overlaps
-│   └── 03_hybrid_search_test.ipynb  # Comparing BM25 vs Vectors
-│
-├── config.py                    # Global settings (Chunk size, Model names)
-├── main.py                      # The entry point to run the CLI bot
-├── requirements.txt             # Dependencies (pdfplumber, chromadb, torch)
-└── README.md                    # Documentation
+├── main_ingest.py               # Script: Run Ingestion Pipeline (Local)
+├── main.py                      # Script: Run Chatbot (App)
+|
+└── README.md
 ```
 
 ### Basira: (Arabic) "Insight" or "Inner Vision."

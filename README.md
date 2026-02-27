@@ -1,6 +1,6 @@
-## Basira AI - Legal Chatbot with RAG
+# Basira AI - Legal Chatbot with RAG
 
-```
+```text
 project_basira/
 │
 ├── .env                         # Secrets! >> cp from .env.example
@@ -45,4 +45,4 @@ project_basira/
 └── README.md
 ```
 
-### Basira: (Arabic) "Insight" or "Inner Vision."
+## Basira: (Arabic) "Insight" or "Inner Vision."

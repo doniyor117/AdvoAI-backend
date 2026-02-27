@@ -1,34 +1,30 @@
 import requests
 import re
-from typing import Dict, Optional
+import tempfile
+import os
+from typing import Dict, Any
 from bs4 import BeautifulSoup
-
-# [ADDED] We bring in the specific HTML partitioner from unstructured
-from unstructured.partition.html import partition_html
+from markitdown import MarkItDown
 
 class LexParser:
     """
-    A specialized scraper for Lex.uz.
-    Fetches the document, cleans Lex-specific UI noise, extracts custom legal metadata,
-    and passes the cleaned HTML directly to Unstructured for semantic partitioning.
+    Fetches Lex.uz documents, cleans the UI noise using BeautifulSoup,
+    extracts metadata, and converts the cleaned HTML to perfect Markdown 
+    using Microsoft's MarkItDown.
     """
     
     def __init__(self):
         self.headers = {
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-        'Accept-Encoding': 'gzip, deflate, br, zstd',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cache-Control': 'max-age=0',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36'
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36'
         }
         self.soup = None
         self.url = None
+        self.md_converter = MarkItDown()
 
     def fetch_html(self, url: str) -> bool:
-        """[KEPT] Fetches data and initializes soup. No changes needed."""
         print(f"🌐 Connecting to: {url}")
         self.url = url if "type=doc" in url else f'{url}?type=doc'
-
         try:
             response = requests.get(self.url, headers=self.headers, timeout=20)
             response.raise_for_status()
@@ -40,14 +36,10 @@ class LexParser:
             return False
 
     def clean_soup(self):
-        """
-        [UPDATED] We keep this! Even though unstructured is smart, it might 
-        accidentally parse the Lex.uz "Listen to audio" buttons as NarrativeText. 
-        It is always best to scrub the UI noise before partitioning.
-        """
+        """Removes Lex.uz UI elements so they don't end up in the Markdown."""
         if not self.soup: return
 
-        for tag in self.soup(["script", "style", "meta", "link", "xml", "o:p"]):
+        for tag in self.soup(["script", "style", "meta", "link"]):
             tag.decompose()
 
         garbage_patterns = [
@@ -62,24 +54,15 @@ class LexParser:
                 if parent:
                     parent.decompose()
 
-    # [REMOVED] def _html_table_to_markdown(...)
-    # GONE! We deleted all 50+ lines of this. Unstructured handles complex HTML 
-    # rowspans and colspans natively now.
-
-    def get_metadata(self) -> Dict[str, any]:
-        """
-        [KEPT] We absolutely keep this! Unstructured can find the "Title", but it 
-        doesn't know what a Lex.uz "doc_id" or "act_type" is. This custom metadata 
-        will be injected into your Vector DB later for powerful filtering.
-        """
+    def get_metadata(self) -> Dict[str, Any]:
+        """Extracts legal metadata directly from the HTML structure."""
         meta = {
             "source_url": self.url.split("?")[0] if self.url else None,
             "doc_id": None,
             "doc_date": None,
             "act_type": "Unknown",
             "title": "Untitled Document",
-            "is_active": True,
-            "status_details": "Active"
+            "is_active": True
         }
 
         if self.soup.title:
@@ -93,57 +76,45 @@ class LexParser:
         if act_form:
             meta["act_type"] = act_form.get_text(strip=True)
 
-        act_title = self.soup.find(class_=lambda c: c and "ACT_TITLE" in c)
-        if act_title:
-            meta["title"] = act_title.get_text(strip=True)
-
-        expiration_node = self.soup.find(class_="aExp")
-        if expiration_node:
-            text = expiration_node.get_text(strip=True)
-            if text:
-                meta["is_active"] = False
-                meta["status_details"] = text
-
         return meta
 
-    # [REMOVED] def get_clean_text(...)
-    # GONE! We no longer want to flatten the HTML into plain text. We want to preserve 
-    # the HTML tags (like <table> and <b>) so Unstructured can "see" the document structure.
-
-    def parse(self) -> Dict[str, any]:
-        """
-        [UPDATED] Instead of returning plain text, this now runs `partition_html` 
-        directly on the cleaned HTML string and returns the structured elements!
-        """
+    def parse(self) -> Dict[str, Any]:
         if not self.soup:
             raise ValueError("Soup not initialized. Call fetch_html() first.")
 
-        # 1. Scrub the Lex.uz UI buttons
+        # 1. Clean the UI buttons
         self.clean_soup()
         
-        # 2. Grab our custom legal metadata
+        # 2. Extract Metadata
         metadata = self.get_metadata()
         
-        # 3. Get the cleaned HTML as a raw string
+        # 3. MarkItDown usually requires a file path. We write our cleaned HTML 
+        # to a temporary file, convert it, and delete the temp file.
+        print("📝 Converting cleaned HTML to Markdown...")
         cleaned_html_string = str(self.soup)
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode='w', encoding='utf-8') as temp_file:
+            temp_file.write(cleaned_html_string)
+            temp_file_path = temp_file.name
 
-        # 4. Pass the HTML string directly to Unstructured!
-        # Notice we use `text=` instead of `filename=` because we are doing this in memory.
-        print("🧠 Partitioning document with Unstructured...")
-        elements = partition_html(text=cleaned_html_string)
+        try:
+            result = self.md_converter.convert(temp_file_path)
+            markdown_content = result.text_content
+        finally:
+            os.remove(temp_file_path) # Clean up
 
         return {
             "metadata": metadata,
-            "elements": elements # This is now a list of Unstructured Element objects!
+            "markdown": markdown_content # The full, perfectly formatted document!
         }
     
 if __name__ == '__main__':
+    # Example usage to test the parser file directly. In production, this would be called from the main ingestion pipeline.:
     url = input("Enter a Lex.uz document URL: ")
     parser = LexParser()
     if parser.fetch_html(url):
         result = parser.parse()
         print("Metadata:", result["metadata"], end="\n\n")
-        print("First 3 Elements:\n")
-        for element in result["elements"][:3]:  # Show the first 3 elements for brevity
-            # It gives you a list of Element objects, carrying metadata and category info
-            print(f"Type: {element.category} | Text: {element.text[:50]}...")
+        show_markdown = input("Show full markdown text? (y/n): ")
+        if show_markdown.lower() == 'y':
+            print(result["markdown"])

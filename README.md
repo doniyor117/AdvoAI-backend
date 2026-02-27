@@ -10,16 +10,15 @@ project_basira/
 ├── config.py                    # (+) Central place for settings (CHUNK_SIZE, MODEL_NAME)
 │
 ├── data/                        
-│   ├── raw_pdfs/                # Local PDF storage
 │   └── golden_dataset.csv       # (+) For testing your bot later
 │   
 ├── notebooks/                   # (+) Your experimental lab
-│   └── 01_pdf_test.ipynb        # Test pdfplumber here before putting it in src/
+│   └── lab.ipynb                # Test, experiment, and evaluate here
 │
 ├── src/
 │   ├── ingestion/               # PHASE 1: READ
 │   │   ├── __init__.py
-│   │   ├── pdf_parser.py        # Class: PDFProcessor
+│   │   ├── lex_parser.py        # Parsing disguised doc file (html) form lex.uz on the fly
 │   │   └── cleaner.py           # Funcs: regex cleaning
 │   │
 │   ├── database/                # PHASE 2: STORE

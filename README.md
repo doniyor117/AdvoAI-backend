@@ -1,48 +1,98 @@
 # Basira AI - Legal Chatbot with RAG
 
 ```text
-project_basira/
-│
-├── .env                         # Secrets! >> cp from .env.example
-├── .env.example                 # .env file variables structure
-├── .gitignore                   # Ignores data/ and .env
-├── requirements.txt             # Deps: pdfplumber, psycopg2-binary, pgvector, torch
-├── config.py                    # (+) Central place for settings (CHUNK_SIZE, MODEL_NAME)
-│
-├── data/                        
-│   └── golden_dataset.csv       # (+) For testing your bot later
-│   
-├── notebooks/                   # (+) Your experimental lab
-│   └── lab.ipynb                # Test, experiment, and evaluate here
-│
-├── src/
-│   ├── ingestion/               # PHASE 1: READ
-│   │   ├── __init__.py
-│   │   ├── lex_parser.py        # Parsing disguised doc file (html) form lex.uz on the fly
-│   │   └── cleaner.py           # Funcs: regex cleaning
-│   │
-│   ├── database/                # PHASE 2: STORE
-│   │   ├── __init__.py
-│   │   ├── schema.sql           # SQL: CREATE TABLE ...
-│   │   └── neon_client.py       # Class: DatabaseManager (Handling connection & queries)
-│   │
-│   ├── preprocessing/           # PHASE 3: CHUNK
-│   │   ├── __init__.py
-│   │   └── chunker.py           # Funcs: window_chunker (Sentence + Neighbors)
-│   │
-│   ├── models/                  # PHASE 4: INTELLIGENCE
-│   │   ├── __init__.py
-│   │   ├── embedder.py          # Class: EmbeddingModel (BGE-M3)
-│   │   ├── reranker.py          # (+) Class: CrossEncoder (The Quality Control)
-│   │   └── llm_client.py        # Class: Google AI Studio (Gemini 2.5 flash) (it is cheap and have context caching)
-│   │
-│   └── app/                     # (+) Organize the app logic
-│       └── chat.py              # The CLI Chat interface
-│
-├── main_ingest.py               # Script: Run Ingestion Pipeline (Local)
-├── main.py                      # Script: Run Chatbot (App)
-|
+basira-backend/
+├── app/
+│   ├── main.py              # FastAPI app entry
+│   ├── config.py            # Settings (env vars)
+│   ├── routes/
+│   │   ├── chat.py          # POST /api/chat
+│   │   ├── ingest.py        # POST /api/ingest (admin)
+│   │   └── health.py        # GET /api/health
+│   ├── services/
+│   │   ├── rag_pipeline.py  # Orchestrates embed → search → rerank → generate
+│   │   ├── embedder.py      # BGE-M3 wrapper
+│   │   ├── reranker.py      # Cross-Encoder wrapper
+│   │   └── llm_client.py    # Gemini API + caching
+│   ├── ingestion/
+│   │   ├── lex_parser.py    # Lex.uz scraper
+│   │   ├── cleaner.py       # Text cleaning
+│   │   └── chunker.py       # Semantic chunking
+│   └── database/
+│       ├── connection.py    # Neon connection pool
+│       ├── schema.sql       # Table definitions
+│       └── queries.py       # Vector search queries
+├── data/
+│   └── golden_dataset.csv   # Evaluation set
+├── tests/
+│   ├── test_parser.py
+│   ├── test_chunker.py
+│   └── test_rag.py
+├── .env.example
+├── requirements.txt
+├── Dockerfile
 └── README.md
 ```
 
+---
+
+## Data Pipeline (Ingestion Flow)
+
+This is the **offline** pipeline that populates the vector database with Uzbek legal documents.
+
+```text
+Step 1: SCRAPE                Step 2: PARSE               Step 3: CHUNK
+┌──────────────┐         ┌──────────────────┐        ┌──────────────────┐
+│  lex.uz URL  │────────▶│   LexParser      │───────▶│ SemanticChunker  │
+│  (HTML doc)  │         │  + Unstructured  │        │  (BGE-M3 based)  │
+└──────────────┘         │  + Metadata      │        └────────┬─────────┘
+                         └──────────────────┘                 │
+                                                              ▼
+Step 4: EMBED                                    Step 5: STORE
+┌──────────────────┐                         ┌──────────────────────┐
+│   BGE-M3 Model   │◀───────────────────────│   Chunk texts        │
+│ (1024-dim vectors)│                        └──────────────────────┘
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────────┐
+│  Neon PostgreSQL     │
+│  pgvector (HNSW)     │
+│  + metadata (JSONB)  │
+└──────────────────────┘
+```
+
+###  Backend (Separate Repo)
+| Component | Tech | Purpose |
+|-----------|------|---------|
+| Framework | **FastAPI** | Async Python API server |
+| ORM/DB Driver | **psycopg2-binary + pgvector** | Direct PostgreSQL + vector ops |
+| Embeddings | **BAAI/bge-m3** (HuggingFace) | Multilingual embeddings (Uzbek/Russian/English) |
+| Chunking | **SemanticChunker** (LangChain) | Meaning-based text splitting |
+| Reranker | **Cross-Encoder** (planned) | Quality control on retrieved chunks |
+| LLM | **Gemini 2.5 Flash** (Google AI API) | Answer generation with context caching |
+| Caching | **Gemini Context Caching** | Cache system prompt + legal context to cut costs |
+| Scraper | **LexParser** (custom) | Lex.uz document ingestion |
+| Deployment | **Railway / Render / Fly.io** | Python hosting with free tiers |
+
+###  Database (Neon PostgreSQL)
+| Table | Purpose |
+|-------|---------|
+| `documents` | Raw document metadata (doc_id, title, act_type, date, status, source_url) |
+| `chunks` | Text chunks with vector embeddings (chunk_id, doc_id FK, text, embedding vector, metadata JSONB) |
+| `conversations` | (Phase 2) Chat history per user session |
+| `users` | (Phase 2) User accounts for marketplace |
+
+**Why Neon?** Free tier, serverless PostgreSQL, native pgvector support, auto-scaling.
+
+###  External Services
+| Service | Purpose | Cost |
+|---------|---------|------|
+| **Google AI Studio** | Gemini 2.5 Flash API + Context Caching | Free tier (generous) |
+| **Neon** | Managed PostgreSQL + pgvector | Free tier (512MB) |
+| **Vercel** | Frontend hosting | Free tier |
+| **Railway/Render** | Backend hosting | Free tier |
+| **HuggingFace** | BGE-M3 model weights | Free (downloaded once) |
+
+---
 ## Basira: (Arabic) "Insight" or "Inner Vision."

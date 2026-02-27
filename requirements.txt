@@ -1,2 +1,11 @@
 psycopg2-binary
 pgvector
+beautifulsoup4
+lxml
+requests
+langchain
+langchain-community
+langchain-huggingface
+langchain-experimental
+sentence-transformers
+unstructured

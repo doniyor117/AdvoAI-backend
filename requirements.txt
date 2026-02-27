@@ -3,6 +3,7 @@ pgvector
 beautifulsoup4
 lxml
 requests
+markitdown
 langchain
 langchain-community
 langchain-huggingface

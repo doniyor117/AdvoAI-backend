@@ -76,8 +76,11 @@ def process_and_ingest_law(url: str) -> Optional[Dict[str, Any]]:
     parent_document_record: Dict[str, Any] = {
         "id": doc_uuid,                                         # UUID4 PK
         "source_doc_id": source_doc_id,                         # From URL, for dedup
-        "title": metadata.get("title", "Untitled Document"),
-        "metadata": metadata,
+        "title": metadata.get("title", "Unknown"),
+        "act_type": metadata.get("act_type", "Unknown"),
+        "doc_date": metadata.get("doc_date"),
+        "source_url": url.split("?")[0],
+        "is_active": metadata.get("is_active", True),
         "full_markdown": markdown,
     }
     print(f"💾 Parent document record prepared (title: '{parent_document_record['title'][:60]}...')")

@@ -15,7 +15,7 @@ from typing import Dict, List, Any, Optional
 
 from app.ingestion.lex_parser import LexParser
 from app.ingestion.chunker import LegalUnstructuredChunker
-from app.services.embedder import LegalEmbedder
+from app.services.embedder import get_embedder
 from app.database.queries import check_duplicate, insert_document, insert_chunks
 
 
@@ -109,7 +109,7 @@ def process_and_ingest_law(url: str, device: str = "cpu", skip_db: bool = False)
 
     # ── Step 5: Generate embeddings ───────────────────────────────────────
 
-    embedder = LegalEmbedder(device=device)
+    embedder = get_embedder(device=device)
     search_chunks = embedder.embed_chunks(search_chunks)
 
     # ── Step 6: Save to database ──────────────────────────────────────────

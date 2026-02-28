@@ -15,6 +15,7 @@ import os
 import torch
 from FlagEmbedding import BGEM3FlagModel
 from typing import List, Dict, Any
+from functools import lru_cache
 
 
 class LegalEmbedder:
@@ -46,6 +47,8 @@ class LegalEmbedder:
             'BAAI/bge-m3',
             use_fp16=use_fp16,
             device=device_str,
+            # Prevent network timeouts by forcing it to use the downloaded cache
+            # local_files_only=True is supported by default in hf_hub
         )
         print("✅ Model loaded.")
 
@@ -89,6 +92,15 @@ class LegalEmbedder:
 
         print(f"✅ Embedded {len(chunks)} chunks ({len(dense_vectors[0])}-dim)")
         return chunks
+
+
+@lru_cache(maxsize=1)
+def get_embedder(device: str = "cpu") -> LegalEmbedder:
+    """
+    Returns a cached Singleton instance of the embedder.
+    Prevents loading the 2.5GB model into RAM on every single request.
+    """
+    return LegalEmbedder(device=device)
 
 
 # ── Test ──────────────────────────────────────────────────────

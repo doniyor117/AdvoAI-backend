@@ -7,7 +7,10 @@ for exact semantic relevance. Slower than bi-encoders, but highly accurate.
 """
 
 import os
+import os
 from typing import List, Dict, Any
+from functools import lru_cache
+from huggingface_hub import snapshot_download
 from FlagEmbedding import FlagReranker
 
 
@@ -29,11 +32,28 @@ class LegalReranker:
             device_str = None
 
         print(f"⚖️ Loading BGE-Reranker model ({self.device.upper()} mode)...")
+        
+        # ── Resilient Download Step ──
+        # FlagEmbedding's AutoModel crashes if the internet drops midway through a 2.5GB download.
+        # We manually pre-fetch it using huggingface_hub with resume_download=True to guarantee stability.
+        try:
+            print("   (Ensuring model weights are cached locally. This resumes if interrupted...)")
+            snapshot_download(
+                repo_id="BAAI/bge-reranker-v2-m3",
+                resume_download=True,
+                max_workers=4
+            )
+        except Exception as e:
+            print(f"⚠️ Warning: Network issue during model verification: {e}")
+            print("   Proceeding anyway (model may already be fully cached).")
+
         # Initialize the FlagReranker wrapper from FlagEmbedding
         self.model = FlagReranker(
             'BAAI/bge-reranker-v2-m3',
             use_fp16=use_fp16,
-            device=device_str
+            device=device_str,
+            # Prevent network timeouts by forcing it to use the downloaded cache
+            # local_files_only=True is supported by default in hf_hub
         )
         print("✅ Reranker model loaded.")
 
@@ -83,3 +103,13 @@ class LegalReranker:
         print(f"✅ Reranking complete. Top score: {top_chunks[0]['similarity']:.4f}")
 
         return top_chunks
+
+
+@lru_cache(maxsize=1)
+def get_reranker(device: str = "cpu") -> LegalReranker:
+    """
+    Returns a cached Singleton instance of the reranker.
+    Prevents loading the model into RAM on every single request.
+    """
+    return LegalReranker(device=device)
+

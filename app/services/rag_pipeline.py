@@ -14,7 +14,7 @@ This is the "Small-to-Big" retrieval strategy:
 from typing import List, Dict, Any
 
 from app.config import settings
-from app.services.embedder import LegalEmbedder
+from app.services.embedder import get_embedder
 from app.database.queries import search_similar_chunks, fetch_parent_documents
 
 
@@ -41,7 +41,7 @@ def retrieve_context(question: str, top_k: int = 5) -> Dict[str, Any]:
     print(f"   Question: {question[:80]}...")
 
     # Step 1: Embed the question
-    embedder = LegalEmbedder()
+    embedder = get_embedder()
     query_output = embedder.model.encode(
         [question],
         batch_size=1,
@@ -60,8 +60,8 @@ def retrieve_context(question: str, top_k: int = 5) -> Dict[str, Any]:
         candidate_chunks = search_similar_chunks(query_embedding, top_k=(top_k * 3))
         
         # Lazy load reranker to save RAM if not used
-        from app.services.reranker import LegalReranker
-        reranker = LegalReranker()
+        from app.services.reranker import get_reranker
+        reranker = get_reranker()
         
         # Rerank and narrow down to top_k
         matched_chunks = reranker.rerank(query=question, chunks=candidate_chunks, top_k=top_k)

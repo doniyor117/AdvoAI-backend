@@ -45,16 +45,16 @@ User Question (Uzbek/Russian)
 | Embeddings | **BAAI/bge-m3** (HuggingFace) | Multilingual embeddings (Uzbek/Russian/English) |
 | Document Parser | **MarkItDown** (Microsoft) | Converts HTML to LLM-friendly Markdown |
 | Chunking | **unstructured** | Semantically chunks text for search indexing |
-| Reranker | **Cross-Encoder** (planned) | Quality control on retrieved chunks |
+| Reranker | **BAAI/bge-reranker-v2-m3** | Config-driven toggle for high precision vs high speed |
 | LLM | **Gemini 2.5 Flash** (Google AI API) | Answer generation using large context windows |
-| Deployment | **Railway / Render / Fly.io** | Python hosting with free tiers |
+| Deployment | **Hugging Face Spaces / Railway** | Python hosting with free tiers |
 
 ### **2.3 Database (Neon PostgreSQL)**
 
 | Table | Purpose |
 | :--- | :--- |
-| `documents` | Parent documents (doc_id, title, metadata JSONB, **full_markdown**) |
-| `chunks` | Search index (chunk_id, **parent_doc_id FK**, text, embedding vector) |
+| `documents` | Parent documents (id UUID PK, source_doc_id, title, metadata JSONB, **full_markdown**) |
+| `chunks` | Search index (id UUID PK, **parent_id FK**, text, embedding vector) |
 | `conversations` | (Phase 2) Chat history per user session |
 | `users` | (Phase 2) User accounts for marketplace |
 
@@ -101,16 +101,16 @@ This is the **online** pipeline that handles user questions in real-time, utiliz
                                 │
                                 ▼
 ┌───────────────────────────────────────────────────────────────┐
-│  Step 1: VECTOR SEARCH (Small Chunks)                         │
-│  Embed query ─▶ SELECT parent_doc_id FROM chunks              │
-│  ORDER BY embedding <=> query_vec LIMIT 5                     │
+│  Step 1: VECTOR SEARCH & RERANK (The "Small" Chunks)          │
+│  Embed query ─▶ SELECT parent_id FROM chunks ORDER BY <=>     │
+│  (Optional: Rerank top 15 chunks using BGE Cross-Encoder)     │
 └───────────────────────────────┬───────────────────────────────┘
                                 │
                                 ▼
 ┌───────────────────────────────────────────────────────────────┐
-│  Step 2: FETCH PARENT (The "Window")                          │
+│  Step 2: FETCH PARENT (The "Big" Window)                      │
 │  SELECT full_markdown FROM documents                          │
-│  WHERE doc_id IN (retrieved_parent_doc_ids)                   │
+│  WHERE id IN (retrieved_parent_ids)                           │
 └───────────────────────────────┬───────────────────────────────┘
                                 │
                                 ▼
@@ -166,19 +166,23 @@ basira-backend/
 │   ├── main.py              # FastAPI app entry
 │   ├── config.py            # Settings (env vars)
 │   ├── routes/
+│   │   ├── __init__.py
 │   │   ├── chat.py
 │   │   ├── ingest.py
 │   │   └── health.py
 │   ├── services/
+│   │   ├── __init__.py
 │   │   ├── rag_pipeline.py  # Orchestrates embed → search → fetch parent → generate
 │   │   ├── embedder.py      # BGE-M3 wrapper
 │   │   ├── reranker.py      # Cross-Encoder wrapper
 │   │   └── llm_client.py    # Gemini API
 │   ├── ingestion/
+│   │   ├── __init__.py
 │   │   ├── lex_parser.py    # Scraper + MarkItDown converter
 │   │   ├── chunker.py       # Unstructured search index builder
 │   │   └── main_ingest.py   # Ingestion pipeline orchestrator
 │   └── database/
+│       ├── __init__.py
 │       ├── connection.py    # Neon connection pool
 │       ├── schema.sql       # Table definitions (documents, chunks)
 │       └── queries.py       # Vector & relational queries
@@ -189,6 +193,18 @@ basira-backend/
 ├── requirements.txt
 └── README.md
 ```
+
+## **7.5 Deployment (Hugging Face Spaces)**
+
+The easiest and most cost-effective way to run `basira-backend` is on a Hugging Face Space (Docker).
+
+1. Create a new Space on [Hugging Face](https://huggingface.co/spaces) and select **Docker** as the environment.
+2. Push your repository to the Space.
+3. Go to the Space's **Settings > Variables and secrets** and define:
+   - `DATABASE_URL` (Your Neon connection string)
+   - `GOOGLE_API_KEY` (Your Gemini API key)
+   - `USE_RERANKER` (`True` or `False`)
+4. The Space will automatically build the `Dockerfile`, bake the BGE models into the image so they are cached, and boot the FastAPI server on port 7860.
 
 ## **8. Development Phases**
 
@@ -217,6 +233,7 @@ basira-backend/
 | **RAG Strategy** | Parent-Child (Small-to-Big) | Solves the "lost context" problem. Small chunks for precise searching; full Markdown documents for perfect LLM context. |
 | **Document Parsing** | MarkItDown (Microsoft) | Converts complex HTML tables/lists into perfect Markdown that Gemini natively understands. |
 | **Embedding Model** | BGE-M3 | Best multilingual model, handles Uzbek+Russian+English natively. |
+| **Reranker** | BGE-Reranker-v2-m3 | Config controlled (`USE_RERANKER`). Toggle on for max precision, off for max speed on CPU. |
 | **Chunking** | Unstructured (`chunk_by_title`) | Groups logical HTML elements together perfectly for the search index. |
 | **Vector DB** | pgvector on Neon | Free, SQL-native. Allows storing vectors (chunks) and raw text (documents) in the same database. |
 | **LLM** | Gemini 2.5 Flash | Massive 1M+ token window allows feeding entire legal acts safely and cheaply. |

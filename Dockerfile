@@ -25,7 +25,8 @@ COPY --chown=user:user requirements.txt .
 
 # 4. Install Python dependencies
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements.txt && \
+    python -m spacy download en_core_web_sm
 
 # 5. Copy the rest of the application
 COPY --chown=user:user . .

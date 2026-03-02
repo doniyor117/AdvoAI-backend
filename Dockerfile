@@ -1,33 +1,37 @@
-FROM python:3.12-slim
+# ============================================================
+# Yurika Backend — Hugging Face Space Dockerfile
+# ============================================================
 
-# Hugging Face Spaces require running as a non-root user.
-# Create a user with UID 1000 and setup home and path.
+FROM python:3.11-slim
+
+# 1. Hugging Face Spaces require running as a non-root user (id 1000)
 RUN useradd -m -u 1000 user
 USER user
-ENV HOME=/home/user \
-    PATH=/home/user/.local/bin:$PATH \
-    HF_HOME=/home/user/.cache/huggingface
+ENV PATH="/home/user/.local/bin:$PATH"
 
-WORKDIR $HOME/app
+WORKDIR /app
 
-# Only copy requirements first to leverage Docker layer caching
-COPY --chown=user requirements.txt .
+# 2. Switch back to root temporarily to install system dependencies (PostgreSQL libs, etc.)
+USER root
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libpq-dev \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+USER user
 
-# Install dependencies
+# 3. Copy requirements first to leverage Docker cache
+COPY --chown=user:user requirements.txt .
+
+# 4. Install Python dependencies
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Pre-bake AI models into the Docker image.
-# Hugging Face Spaces sleep when inactive. Pre-downloading ensures 
-# the server boots instantly without downloading massive models on every wake.
-RUN python -c "from FlagEmbedding import FlagModel; FlagModel('BAAI/bge-m3', device='cpu')"
-RUN python -c "from FlagEmbedding import FlagReranker; FlagReranker('BAAI/bge-reranker-v2-m3', use_fp16=False, device='cpu')"
+# 5. Copy the rest of the application
+COPY --chown=user:user . .
 
-# Copy the rest of the application code
-COPY --chown=user . .
-
-# Hugging Face Spaces explicitly route traffic to port 7860
+# 6. Expose the port required by Hugging Face Spaces
 EXPOSE 7860
 
-# Start the FastAPI application
+# 7. Start the FastAPI application
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7860"]

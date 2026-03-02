@@ -111,8 +111,8 @@ def register(request: RegisterRequest, response: Response):
     if not user:
         raise HTTPException(status_code=500, detail="Failed to create account. Please try again.")
 
-    # Set auth cookie
-    _set_auth_cookie(response, str(user["id"]))
+    # Set auth cookie + return token in body
+    token = _set_auth_cookie(response, str(user["id"]))
     update_last_login(str(user["id"]))
 
     logger.info(f"New user registered: {request.email}")
@@ -120,6 +120,7 @@ def register(request: RegisterRequest, response: Response):
     return {
         "message": "Account created successfully.",
         "user": _user_to_response(user),
+        "token": token,
     }
 
 
@@ -145,8 +146,8 @@ def login(request: LoginRequest, response: Response):
     if not user.get("is_active"):
         raise HTTPException(status_code=403, detail="Account is deactivated.")
 
-    # Set auth cookie
-    _set_auth_cookie(response, str(user["id"]))
+    # Set auth cookie + return token in body
+    token = _set_auth_cookie(response, str(user["id"]))
     update_last_login(str(user["id"]))
 
     logger.info(f"User logged in: {request.email}")
@@ -154,6 +155,7 @@ def login(request: LoginRequest, response: Response):
     return {
         "message": "Login successful.",
         "user": _user_to_response(user),
+        "token": token,
     }
 
 
@@ -208,7 +210,7 @@ def google_auth(request: GoogleAuthRequest, response: Response):
     if not user:
         raise HTTPException(status_code=500, detail="Failed to process Google sign-in.")
 
-    _set_auth_cookie(response, str(user["id"]))
+    token = _set_auth_cookie(response, str(user["id"]))
     update_last_login(str(user["id"]))
 
     logger.info(f"Google auth: {email}")
@@ -216,6 +218,7 @@ def google_auth(request: GoogleAuthRequest, response: Response):
     return {
         "message": "Google sign-in successful.",
         "user": _user_to_response(user),
+        "token": token,
     }
 
 

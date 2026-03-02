@@ -40,11 +40,21 @@ def decode_access_token(token: str) -> Optional[dict]:
 
 async def get_current_user(request: Request) -> Optional[Dict[str, Any]]:
     """
-    Extracts and validates JWT from cookies.
+    Extracts and validates JWT from Authorization header or cookies.
+    Checks header first (for cross-domain/mobile), falls back to cookies.
     Returns user dict or None for unauthenticated (guest) users.
     Does NOT raise — returns None for guests.
     """
-    token = request.cookies.get("yurika_token")
+    # 1. Check Authorization header first (works cross-domain)
+    token = None
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+
+    # 2. Fallback to cookie (works same-domain)
+    if not token:
+        token = request.cookies.get("yurika_token")
+
     if not token:
         return None
 

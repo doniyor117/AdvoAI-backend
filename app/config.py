@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     GUEST_MESSAGE_LIMIT: int = 3
     FREE_DAILY_LIMIT: int = 20
 
+    # ── CORS ─────────────────────────────────────────────────
+    CORS_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000"
+
     # Pydantic v2 specific setting config
     model_config = SettingsConfigDict(
         env_file=".env", 

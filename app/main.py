@@ -20,12 +20,11 @@ app = FastAPI(
     version="2.0.0",
 )
 
-# Configure CORS — credentials require explicit origins (not "*")
+# Configure CORS — reads from CORS_ORIGINS env variable (comma-separated)
 _ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "http://10.144.172.154:3000",
-    # Add your production domain here
+    origin.strip()
+    for origin in settings.CORS_ORIGINS.split(",")
+    if origin.strip()
 ]
 
 app.add_middleware(

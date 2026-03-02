@@ -63,12 +63,13 @@ def _verify_password(password: str, hashed: str) -> bool:
 def _set_auth_cookie(response: Response, user_id: str) -> str:
     """Creates JWT and sets it as an HTTP-only cookie."""
     token = create_access_token({"sub": user_id})
+    is_production = settings.ENVIRONMENT != "development"
     response.set_cookie(
         key="yurika_token",
         value=token,
         httponly=True,
-        secure=settings.ENVIRONMENT != "development",
-        samesite="lax",
+        secure=is_production,
+        samesite="none" if is_production else "lax",
         max_age=settings.JWT_EXPIRY_HOURS * 3600,
         path="/",
     )

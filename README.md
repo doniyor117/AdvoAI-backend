@@ -1,3 +1,13 @@
+title: Yurika Backend
+emoji: ⚖️
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+sdk_version: "1.0.0"
+python_version: "3.11"
+app_file: app.py
+pinned: false
+
 # Yurika Backend
 
 **FastAPI backend powering the Yurika AI Legal Assistant.**

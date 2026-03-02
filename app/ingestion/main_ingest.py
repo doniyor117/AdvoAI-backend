@@ -52,7 +52,7 @@ def process_and_ingest_law(url: str, device: str = "cpu", skip_db: bool = False)
     """
 
     print("\n" + "=" * 60)
-    print("🚀 BASIRA INGESTION PIPELINE")
+    print("🚀 YURIKA INGESTION PIPELINE")
     print("=" * 60)
 
     # ── Step 1: Extract source_doc_id and check for duplicates ────────────
@@ -156,7 +156,7 @@ def process_and_ingest_law(url: str, device: str = "cpu", skip_db: bool = False)
 # ── Test ──────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Basira Ingestion Pipeline")
+    parser = argparse.ArgumentParser(description="Yurika Ingestion Pipeline")
     parser.add_argument("--url", type=str, default="https://lex.uz/en/docs/-7904841", help="Document URL to ingest")
     parser.add_argument("--device", type=str, choices=["cpu", "gpu"], default="cpu", help="Device to use for embedding (cpu or gpu)")
     parser.add_argument("--skip-db", action="store_true", help="Skip saving to database")

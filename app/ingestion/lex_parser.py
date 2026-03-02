@@ -67,10 +67,22 @@ class LexParser:
 
         if self.soup.title:
             title_text = self.soup.title.get_text(strip=True)
-            match = re.search(r"^(\d+)\s+(\d{2}\.\d{2}\.\d{4})", title_text)
+            # Lex.uz title format: "{doc_number} {date}. {actual_title}"
+            # e.g. "784-сон 11.12.2025. Tadbirkorlik subyektlariga..."
+            match = re.search(r"^(\d+)\s+(\d{2}\.\d{2}\.\d{4})\.\s*(.*)", title_text, re.DOTALL)
             if match:
                 meta["doc_id"] = match.group(1)
                 meta["doc_date"] = match.group(2)
+                # The actual title is everything after the date
+                actual_title = match.group(3).strip()
+                if actual_title:
+                    meta["title"] = actual_title
+                else:
+                    meta["title"] = title_text  # fallback to full title
+            else:
+                # No regex match — use the full <title> text
+                if title_text:
+                    meta["title"] = title_text
 
         act_form = self.soup.find(class_=lambda c: c and "ACT_FORM" in c)
         if act_form:

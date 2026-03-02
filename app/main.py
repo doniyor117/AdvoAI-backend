@@ -15,15 +15,22 @@ from app.config import settings
 
 # Initialize FastAPI App
 app = FastAPI(
-    title="Basira Legal Chatbot API",
+    title="Yurika Legal Chatbot API",
     description="Hybrid Parent-Child RAG backend for Uzbekistan legal system.",
-    version="1.0.0",
+    version="2.0.0",
 )
 
-# Configure CORS for the frontend React application
+# Configure CORS — credentials require explicit origins (not "*")
+_ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://10.144.172.154:3000",
+    # Add your production domain here
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update this in production to specific domains
+    allow_origins=_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -31,8 +38,12 @@ app.add_middleware(
 
 # ── API Routes (Modular) ──
 
-from app.routes import health, chat, ingest
+from app.routes import health, chat, ingest, auth, sessions, admin
 
 app.include_router(health.router, prefix="/api/health", tags=["Health"])
+app.include_router(auth.router, prefix="/api/auth", tags=["Auth"])
 app.include_router(chat.router, prefix="/api/chat", tags=["Chat"])
+app.include_router(sessions.router, prefix="/api/sessions", tags=["Sessions"])
+app.include_router(admin.router, prefix="/api/admin", tags=["Admin"])
 app.include_router(ingest.router, prefix="/api/ingest", tags=["Ingestion"])
+

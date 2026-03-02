@@ -1,5 +1,5 @@
 # ============================================================
-# Project Basira — Python Dependencies
+# Yurika — Python Dependencies
 # ============================================================
 
 # ── Database ─────────────────────────────────────────────────
@@ -29,3 +29,9 @@ google-genai
 fastapi
 uvicorn
 pydantic-settings
+
+# ── Auth ─────────────────────────────────────────────────────
+bcrypt
+python-jose[cryptography]
+google-auth
+email-validator

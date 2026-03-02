@@ -1,7 +1,7 @@
 """
 rag_pipeline.py — RAG Query Pipeline
 
-The "brain" of the Basira chatbot. Given a user's question:
+The "brain" of the Yurika chatbot. Given a user's question:
     1. Embed the question using BGE-M3
     2. Search pgvector for the most similar chunks
     3. Fetch the full parent Markdown documents

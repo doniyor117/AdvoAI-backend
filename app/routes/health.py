@@ -20,7 +20,7 @@ def health_check():
     """
     Basic health check. Simply verifies the FastAPI server is reachable.
     """
-    return {"status": "online", "message": "Basira API is running"}
+    return {"status": "online", "message": "Yurika API is running"}
 
 
 @router.get("/db")

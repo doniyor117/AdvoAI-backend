@@ -1,250 +1,181 @@
-# **Project Basira — Architecture & Process Flow**
+# Yurika Backend
 
-**Basira** (بصيرة): "Insight" or "Inner Vision" — An AI-powered legal chatbot for Uzbekistan's legal system, built on a Hybrid Parent-Child RAG (Retrieval-Augmented Generation) architecture.
+**FastAPI backend powering the Yurika AI Legal Assistant.**
 
-## **1. High-Level Overview**
+A hybrid Parent-Child RAG (Retrieval-Augmented Generation) system for Uzbekistan's legal documents, backed by PostgreSQL + pgvector and Google Gemini.
+
+---
+
+## Quick Start
+
+```bash
+# Environment
+conda create -n basira_libs python=3.12 -y
+conda activate basira_libs
+pip install -r requirements.txt
+
+# Configuration
+cp .env.example .env
+# Fill in DATABASE_URL, GOOGLE_API_KEY, JWT_SECRET_KEY
+
+# Database
+psql "$DATABASE_URL" -f app/database/schema_unified.sql
+
+# Run
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+The API will be available at `http://localhost:8000`. Interactive docs at `/docs`.
+
+---
+
+## Project Structure
 
 ```
-User Question (Uzbek/Russian)
-        │
-        ▼
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────────┐
-│   Frontend      │────▶│   Backend API    │────▶│   Neon PostgreSQL   │
-│   (React/Next)  │◀────│   (FastAPI)      │◀────│   + pgvector        │
-└─────────────────┘     └──────────────────┘     └─────────────────────┘
-                              │      ▲
-                              ▼      │
-                        ┌──────────────────┐
-                        │  Google AI API   │
-                        │  Gemini 2.5 Flash│
-                        │  (1M Context)    │
-                        └──────────────────┘
+app/
+├── main.py                  # FastAPI app + CORS + route mounting
+├── config.py                # Pydantic settings loaded from .env
+├── middleware.py             # JWT auth, rate limits, ban enforcement
+├── database/
+│   ├── connection.py         # PostgreSQL connection pool (psycopg2)
+│   ├── queries.py            # All SQL query functions (~600 lines)
+│   └── schema_unified.sql    # Complete DB schema (idempotent, safe to re-run)
+├── ingestion/
+│   ├── lex_parser.py         # Lex.uz HTML → structured Markdown
+│   ├── chunker.py            # Semantic element-based chunking
+│   └── main_ingest.py        # End-to-end ingestion orchestrator
+├── routes/
+│   ├── auth.py               # Register, login, Google OAuth, profile update
+│   ├── chat.py               # POST /api/chat/ — RAG chat endpoint
+│   ├── sessions.py           # CRUD for chat sessions
+│   ├── admin.py              # Admin panel APIs (settings, docs, users)
+│   ├── ingest.py             # POST /api/admin/ingest — trigger ingestion
+│   └── health.py             # GET /api/health/
+└── services/
+    ├── embedder.py            # BGE-M3 embedding service (1024-dim)
+    ├── llm_client.py          # Google Gemini wrapper + retry logic
+    ├── prompts.py             # System prompts for legal analysis
+    ├── rag_pipeline.py        # Full RAG: embed → search → reconstruct → generate
+    └── reranker.py            # Optional cross-encoder reranker
 ```
 
-**Core Idea:** User asks a legal question → Backend searches small chunks in the vector DB to find a match → Backend retrieves the **ENTIRE Markdown document** linked to that chunk → Gemini generates a grounded answer using the full document's context.
+---
 
-## **2. System Architecture (Detailed)**
+## Core Concepts
 
-### **2.1 Frontend (Separate Repo)**
+### RAG Pipeline (`services/rag_pipeline.py`)
 
-| Component | Tech | Purpose |
-| :--- | :--- | :--- |
-| Framework | **React** or **Next.js** | SPA / SSR chatbot UI |
-| Styling | **Tailwind CSS** | Clean, responsive legal interface |
-| State | **React Context / Zustand** | Chat history, session management |
-| HTTP Client | **Axios / fetch** | REST calls to backend API |
-| Auth (future) | **Clerk / NextAuth** | User accounts for marketplace |
-| Deployment | **Vercel** | Free tier, auto-deploy from GitHub |
+1. **Embed** user query with BGE-M3
+2. **Search** pgvector for top-K similar chunks (HNSW cosine)
+3. **Reconstruct** full parent documents from matched chunks
+4. **Rerank** *(optional)* with cross-encoder
+5. **Generate** answer with Gemini using full document context + chat history
 
-### **2.2 Backend (Separate Repo)**
+### Ingestion Pipeline (`ingestion/`)
 
-| Component | Tech | Purpose |
-| :--- | :--- | :--- |
-| Framework | **FastAPI** | Async Python API server |
-| ORM/DB Driver | **psycopg2-binary + pgvector** | Direct PostgreSQL + vector ops |
-| Embeddings | **BAAI/bge-m3** (HuggingFace) | Multilingual embeddings (Uzbek/Russian/English) |
-| Document Parser | **MarkItDown** (Microsoft) | Converts HTML to LLM-friendly Markdown |
-| Chunking | **unstructured** | Semantically chunks text for search indexing |
-| Reranker | **BAAI/bge-reranker-v2-m3** | Config-driven toggle for high precision vs high speed |
-| LLM | **Gemini 2.5 Flash** (Google AI API) | Answer generation using large context windows |
-| Deployment | **Hugging Face Spaces / Railway** | Python hosting with free tiers |
+```
+Lex.uz URL → lex_parser.py → Markdown + metadata
+                                    ↓
+                              chunker.py → semantic chunks
+                                    ↓
+                             embedder.py → 1024-dim vectors
+                                    ↓
+                            PostgreSQL (documents + chunks tables)
+```
 
-### **2.3 Database (Neon PostgreSQL)**
+### Authentication (`middleware.py` + `routes/auth.py`)
+
+- **JWT** tokens in HTTP-only cookies (`yurika_token`)
+- **bcrypt** password hashing
+- **Google OAuth** via ID token verification
+- **Middleware**: `require_auth` extracts user from cookie, checks ban status
+- **Middleware**: `require_admin` verifies `role = 'admin'`
+- **Rate limiting**: guest (by fingerprint) and registered user (by user ID)
+
+### Rolling Chat Memory (`routes/chat.py`)
+
+Each session maintains a `rolling_summary` field. After every exchange, the LLM condenses the full conversation into a concise summary. This summary is sent as context in subsequent messages, enabling coherent multi-turn conversations without exceeding token limits.
+
+---
+
+## API Routes
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| `POST` | `/api/auth/register` | — | Register with email/password |
+| `POST` | `/api/auth/login` | — | Login |
+| `POST` | `/api/auth/google` | — | Google OAuth |
+| `POST` | `/api/auth/logout` | — | Clear cookie |
+| `GET` | `/api/auth/me` | JWT | Current user |
+| `PATCH` | `/api/auth/me` | JWT | Update profile |
+| `POST` | `/api/chat/` | — | RAG chat (supports guests) |
+| `GET` | `/api/sessions` | JWT | List sessions |
+| `POST` | `/api/sessions` | JWT | Create session |
+| `PATCH` | `/api/sessions/{id}` | JWT | Rename/pin session |
+| `DELETE` | `/api/sessions/{id}` | JWT | Delete session |
+| `GET` | `/api/admin/stats` | Admin | Dashboard stats |
+| `GET/PATCH` | `/api/admin/settings` | Admin | System settings |
+| `GET/PATCH/DELETE` | `/api/admin/documents/{id}` | Admin | Document CRUD |
+| `GET` | `/api/admin/users` | Admin | List users |
+| `PATCH` | `/api/admin/users/{id}/ban` | Admin | Toggle ban |
+| `PATCH` | `/api/admin/users/{id}/role` | Admin | Change role |
+| `GET` | `/api/admin/users/{id}/stats` | Admin | User analytics |
+| `POST` | `/api/admin/ingest` | Admin | Ingest from URL |
+
+---
+
+## Environment Variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `DATABASE_URL` | ✅ | — | PostgreSQL connection string |
+| `GOOGLE_API_KEY` | ✅ | — | Google Gemini API key |
+| `JWT_SECRET_KEY` | ✅ | — | Secret for JWT signing |
+| `JWT_ALGORITHM` | — | `HS256` | JWT algorithm |
+| `JWT_EXPIRY_HOURS` | — | `72` | Token expiry |
+| `GOOGLE_CLIENT_ID` | — | — | For Google OAuth |
+| `GOOGLE_CLIENT_SECRET` | — | — | For Google OAuth |
+| `USE_RERANKER` | — | `False` | Enable cross-encoder reranking |
+| `ENVIRONMENT` | — | `development` | `development` / `production` |
+| `GUEST_MESSAGE_LIMIT` | — | `3` | Overridden by DB `system_settings` |
+| `FREE_DAILY_LIMIT` | — | `20` | Overridden by DB `system_settings` |
+
+---
+
+## Database
+
+Uses **Neon PostgreSQL** with **pgvector** extension.
+
+Apply the schema (idempotent — safe to re-run):
+
+```bash
+psql "$DATABASE_URL" -f app/database/schema_unified.sql
+```
 
 | Table | Purpose |
-| :--- | :--- |
-| `documents` | Parent documents (id UUID PK, source_doc_id, title, metadata JSONB, **full_markdown**) |
-| `chunks` | Search index (id UUID PK, **parent_id FK**, text, embedding vector) |
-| `conversations` | (Phase 2) Chat history per user session |
-| `users` | (Phase 2) User accounts for marketplace |
+|---|---|
+| `documents` | Full legal documents with metadata |
+| `chunks` | Vector-indexed search chunks (FK → documents, CASCADE) |
+| `users` | User accounts (email/Google, roles, ban status) |
+| `chat_sessions` | Chat history with rolling summaries |
+| `usage_logs` | Daily message counts per user |
+| `guest_usage` | Guest rate limiting by browser fingerprint |
+| `system_settings` | Admin-configurable key-value store |
 
-**Why Neon?** Free tier, serverless PostgreSQL, native pgvector support, auto-scaling.
+---
 
-## **3. Data Pipeline (Ingestion Flow)**
+## Scripts
 
-This is the **offline** pipeline that populates the database using the "Small-to-Big" approach.
+| Script | Usage |
+|---|---|
+| `scripts/run_schema.py` | `python scripts/run_schema.py` — Apply schema using `.env` |
+| `scripts/repair_titles.py` | `python scripts/repair_titles.py` — Re-extract titles from Lex.uz |
 
+---
+
+## Docker
+
+```bash
+docker build -t yurika-backend .
+docker run -p 8000:8000 --env-file .env yurika-backend
 ```
-Step 1: SCRAPE & CLEAN                        Step 2: SPLIT PATHS (Parent/Child)
-┌──────────────┐                        ┌────────────────────────────────────────┐
-│  lex.uz URL  │────▶ LexParser ───────▶│ MarkItDown ───▶ Full Markdown Document │
-│  (HTML doc)  │      (Clean HTML)      │ unstructured ─▶ Search Chunks          │
-└──────────────┘                        └────────────────────────────────────────┘
-                                                               │
-                                                               ▼
-Step 4: STORE                                Step 3: EMBED CHUNKS
-┌────────────────────────┐                   ┌────────────────────────┐
-│ Neon DB                │                   │      BGE-M3 Model      │
-│ 1. `documents` (MD)    │◀──────────────────│  (1024-dim vectors)    │
-│ 2. `chunks` (Vectors)  │                   └────────────────────────┘
-└────────────────────────┘
-```
-
-### **Pipeline Details:**
-
-| Phase | Module | Action | Output |
-| :--- | :--- | :--- | :--- |
-| **1. Parse** | `lex_parser.py` | Scrapes Lex.uz, cleans UI noise, extracts metadata, runs MarkItDown. | metadata, full_markdown |
-| **2. Chunk** | `chunker.py` | Uses unstructured (`chunk_by_title`) on cleaned HTML. | List of chunks with parent_doc_id. |
-| **3. Orchestrate** | `main_ingest.py` | Ties parser and chunker together, manages relations. | Parent Document & Child Chunks |
-| **4. Embed** | `embedder.py` | Generates BGE-M3 vectors for the small chunks only. | 1024-dim vectors |
-| **5. Store** | `database/` | Saves full MD to `documents`, saves vectors to `chunks`. | Indexed PostgreSQL rows |
-
-## **4. Query Flow (Runtime / Chat)**
-
-This is the **online** pipeline that handles user questions in real-time, utilizing Parent-Child retrieval.
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        USER ASKS A QUESTION                        │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
-┌───────────────────────────────────────────────────────────────┐
-│  Step 1: VECTOR SEARCH & RERANK (The "Small" Chunks)          │
-│  Embed query ─▶ SELECT parent_id FROM chunks ORDER BY <=>     │
-│  (Optional: Rerank top 15 chunks using BGE Cross-Encoder)     │
-└───────────────────────────────┬───────────────────────────────┘
-                                │
-                                ▼
-┌───────────────────────────────────────────────────────────────┐
-│  Step 2: FETCH PARENT (The "Big" Window)                      │
-│  SELECT full_markdown FROM documents                          │
-│  WHERE id IN (retrieved_parent_ids)                           │
-└───────────────────────────────┬───────────────────────────────┘
-                                │
-                                ▼
-┌───────────────────────────────────────────────────────────────┐
-│  Step 3: GENERATE (Gemini 2.5 Flash)                          │
-│  Send System Prompt + User Query + ENTIRE Markdown Document   │
-│  Gemini sees tables, lists, and context perfectly intact      │
-└───────────────────────────────┬───────────────────────────────┘
-                                │
-                                ▼
-┌───────────────────────────────────────────────────────────────┐
-│  Step 4: RESPOND                                              │
-│  Formatted answer citing specific articles with Lex.uz links  │
-└───────────────────────────────────────────────────────────────┘
-```
-
-## **5. API Endpoints (Backend)**
-
-### **Phase 1 (Chatbot MVP)**
-
-| Method | Endpoint | Description |
-| :--- | :--- | :--- |
-| POST | `/api/chat` | Send message, get AI response |
-| GET | `/api/health` | Health check |
-| POST | `/api/ingest` | Trigger document ingestion via `main_ingest.py` |
-
-### **Phase 2 (Marketplace)**
-
-| Method | Endpoint | Description |
-| :--- | :--- | :--- |
-| POST | `/api/auth/register` | User registration |
-| POST | `/api/auth/login` | User login |
-| GET | `/api/conversations` | List user's chat history |
-| GET | `/api/marketplace/lawyers` | Browse lawyers |
-
-## **6. Cost Analysis (Free Tier Strategy)**
-
-| Service | Free Tier | Limit | Enough? |
-| :--- | :--- | :--- | :--- |
-| Gemini 2.5 Flash | Free | 15 RPM, 1M TPM | ✅ For MVP |
-| Neon PostgreSQL | Free | 512MB storage | ✅ Efficient (only small chunks embedded) |
-| Vercel | Free | 100GB bandwidth | ✅ For MVP |
-| Railway | Free | $5/month credit | ✅ For MVP |
-| BGE-M3 | Free | Self-hosted | ✅ Always |
-
-## **7. Repo Structure (Proposed)**
-
-### **Backend (basira-backend/)**
-
-```
-basira-backend/
-├── app/
-│   ├── main.py              # FastAPI app entry
-│   ├── config.py            # Settings (env vars)
-│   ├── routes/
-│   │   ├── __init__.py
-│   │   ├── chat.py
-│   │   ├── ingest.py
-│   │   └── health.py
-│   ├── services/
-│   │   ├── __init__.py
-│   │   ├── rag_pipeline.py  # Orchestrates embed → search → fetch parent → generate
-│   │   ├── embedder.py      # BGE-M3 wrapper
-│   │   ├── reranker.py      # Cross-Encoder wrapper
-│   │   └── llm_client.py    # Gemini API
-│   ├── ingestion/
-│   │   ├── __init__.py
-│   │   ├── lex_parser.py    # Scraper + MarkItDown converter
-│   │   ├── chunker.py       # Unstructured search index builder
-│   │   └── main_ingest.py   # Ingestion pipeline orchestrator
-│   └── database/
-│       ├── __init__.py
-│       ├── connection.py    # Neon connection pool
-│       ├── schema.sql       # Table definitions (documents, chunks)
-│       └── queries.py       # Vector & relational queries
-├── data/
-│   └── golden_dataset.csv   # Evaluation set
-├── tests/
-├── .env.example
-├── requirements.txt
-└── README.md
-```
-
-## **7.5 Deployment (Hugging Face Spaces)**
-
-The easiest and most cost-effective way to run `basira-backend` is on a Hugging Face Space (Docker).
-
-1. Create a new Space on [Hugging Face](https://huggingface.co/spaces) and select **Docker** as the environment.
-2. Push your repository to the Space.
-3. Go to the Space's **Settings > Variables and secrets** and define:
-   - `DATABASE_URL` (Your Neon connection string)
-   - `GOOGLE_API_KEY` (Your Gemini API key)
-   - `USE_RERANKER` (`True` or `False`)
-4. The Space will automatically build the `Dockerfile`, bake the BGE models into the image so they are cached, and boot the FastAPI server on port 7860.
-
-## **8. Development Phases**
-
-### **Phase 1: MVP (Chatbot Only) — 4-6 weeks**
-
-| Week | Task |
-| :--- | :--- |
-| 1 | Finalize `main_ingest.py` pipeline (MarkItDown + Unstructured) |
-| 2 | Set up Neon DB, implement vector search + HNSW indexing |
-| 3 | Build Parent-Child RAG pipeline (search chunk → fetch MD → generate) |
-| 4 | Create FastAPI endpoints, test with golden dataset |
-| 5 | Build React/Next.js chat UI |
-| 6 | Integration testing, deploy to Vercel + Railway |
-
-### **Phase 2: Marketplace — 4-6 weeks**
-
-| Week | Task |
-| :--- | :--- |
-| 7-8 | User auth (Clerk/NextAuth), conversation persistence |
-| 9-10 | Lawyer profiles, consultation booking system |
-
-## **9. Key Technical Decisions**
-
-| Decision | Choice | Why |
-| :--- | :--- | :--- |
-| **RAG Strategy** | Parent-Child (Small-to-Big) | Solves the "lost context" problem. Small chunks for precise searching; full Markdown documents for perfect LLM context. |
-| **Document Parsing** | MarkItDown (Microsoft) | Converts complex HTML tables/lists into perfect Markdown that Gemini natively understands. |
-| **Embedding Model** | BGE-M3 | Best multilingual model, handles Uzbek+Russian+English natively. |
-| **Reranker** | BGE-Reranker-v2-m3 | Config controlled (`USE_RERANKER`). Toggle on for max precision, off for max speed on CPU. |
-| **Chunking** | Unstructured (`chunk_by_title`) | Groups logical HTML elements together perfectly for the search index. |
-| **Vector DB** | pgvector on Neon | Free, SQL-native. Allows storing vectors (chunks) and raw text (documents) in the same database. |
-| **LLM** | Gemini 2.5 Flash | Massive 1M+ token window allows feeding entire legal acts safely and cheaply. |
-
-## **10. Risks & Mitigations**
-
-| Risk | Impact | Mitigation |
-| :--- | :--- | :--- |
-| Lex.uz blocks scraping | No data | Respectful rate limiting, cache responses locally. |
-| TPM Limits | Rate Limiting | Monitor Gemini 1M TPM limit if sending massive civil codes repeatedly. |
-| Legal accuracy concerns | Liability | Clear "not legal advice" disclaimers, cite sources always. |
-| Neon 512MB limit | DB full | Small-to-Big RAG actually saves space! (Only chunking what's needed for search, not generating overlapping window chunks). |
-
-*Updated for Project Basira Architecture V2 — February 2026*

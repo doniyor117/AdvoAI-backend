@@ -1,5 +1,5 @@
 -- ============================================================
--- Project Basira — Database Schema
+-- Yurika — Database Schema
 -- PostgreSQL + pgvector (Neon)
 -- ============================================================
 

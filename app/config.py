@@ -19,8 +19,6 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     
     # Database Config
-    # No default value here means Pydantic will throw a validation error
-    # if DATABASE_URL is missing from the environment.
     DATABASE_URL: str
     
     # Google AI Config
@@ -29,13 +27,27 @@ class Settings(BaseSettings):
     # Feature Toggles
     USE_RERANKER: bool = False
 
+    # ── JWT Auth ─────────────────────────────────────────────
+    JWT_SECRET_KEY: str = "change-me-in-production-use-openssl-rand-hex-32"
+    JWT_ALGORITHM: str = "HS256"
+    JWT_EXPIRY_HOURS: int = 72
+
+    # ── Google OAuth ─────────────────────────────────────────
+    GOOGLE_CLIENT_ID: str = ""
+    GOOGLE_CLIENT_SECRET: str = ""
+
+    # ── Usage Limits ─────────────────────────────────────────
+    GUEST_MESSAGE_LIMIT: int = 3
+    FREE_DAILY_LIMIT: int = 20
+
     # Pydantic v2 specific setting config
     model_config = SettingsConfigDict(
         env_file=".env", 
         env_file_encoding="utf-8",
-        extra="ignore"  # Ignore env vars not defined in the class
+        extra="ignore"
     )
 
 
 # Instantiate a singleton settings object to be imported elsewhere
 settings = Settings()
+

@@ -8,6 +8,25 @@ venv/
 __pycache__/
 *.pkl
 
+# Next.js specific build/cache
+/out/
+/build/
+*.tsbuildinfo
+next-env.d.ts
+
+# Linter cache
+.eslintcache
+
+# Cloud/Deployment (if using Vercel)
+.vercel/
+
+# Editor/OS settings (optional but good practice)
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+
+
 .vscode/
 
 # Byte-compiled / optimized / DLL files

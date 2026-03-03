@@ -35,6 +35,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Root endpoint (required for HF Spaces health check) ──
+
+@app.get("/")
+def root():
+    return {"status": "online", "service": "Yurika Legal Chatbot API"}
+
 # ── API Routes (Modular) ──
 
 from app.routes import health, chat, ingest, auth, sessions, admin

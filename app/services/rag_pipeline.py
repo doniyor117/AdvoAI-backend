@@ -15,7 +15,7 @@ import logging
 from typing import List, Dict, Any
 
 from app.services.embedder import get_embedder
-from app.database.queries import search_similar_chunks, fetch_parent_documents
+from app.database.queries import search_similar_chunks, fetch_document_parts
 
 logger = logging.getLogger(__name__)
 
@@ -49,12 +49,12 @@ def retrieve_context(question: str, top_k: int = 5) -> Dict[str, Any]:
     if matched_chunks:
         logger.info(f"Top similarity score: {matched_chunks[0]['similarity']:.4f}")
 
-    # Step 3: Get unique parent document IDs
-    parent_ids = list(set(chunk["parent_id"] for chunk in matched_chunks))
-    logger.info(f"Fetching {len(parent_ids)} unique parent documents...")
+    # Step 3: Get unique document part IDs
+    part_ids = list(set(chunk["document_part_id"] for chunk in matched_chunks))
+    logger.info(f"Fetching {len(part_ids)} unique document parts (Mega-chunks)...")
 
-    # Step 4: Fetch full parent Markdown documents
-    parent_documents = fetch_parent_documents(parent_ids)
+    # Step 4: Fetch full text of document parts
+    parent_documents = fetch_document_parts(part_ids)
 
     # Step 5: Combine all parent Markdown into one context string
     context_markdown = "\n\n---\n\n".join(

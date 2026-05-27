@@ -1,11 +1,6 @@
 """
 prompts.py — Centralized Prompt Registry
-
-All LLM system prompts, RAG instructions, and summarization templates
-are defined here. This makes prompt management, versioning, and A/B
-testing straightforward.
 """
-
 
 # ── Main Legal Assistant Prompt ──────────────────────────────
 
@@ -26,81 +21,95 @@ Rules:
 """
 
 
-# ── RAG Context Template ─────────────────────────────────────
+# ── Final User Turn Templates (Context Injection) ────────────
 
-RAG_USER_PROMPT_TEMPLATE = """## Legal Document Context
+RAG_USER_PROMPT_TEMPLATE = """[SYSTEM INJECTED CONTEXT]
+---
+ARCHIVE SUMMARY OF OLDER CONVERSATION:
+{session_summary}
 
+RELEVANT LEGAL DOCUMENTS:
 {context_markdown}
-
 ---
+[/SYSTEM INJECTED CONTEXT]
 
-## Conversation Summary (for continuity)
-
-{conversation_summary}
-
----
-
-## User's Question
-
-{question}
+User's Question: {question}
 """
 
-RAG_USER_PROMPT_NO_HISTORY_TEMPLATE = """## Legal Document Context
-
-{context_markdown}
-
+RAG_USER_PROMPT_NO_HISTORY_TEMPLATE = """[SYSTEM INJECTED CONTEXT]
 ---
+RELEVANT LEGAL DOCUMENTS:
+{context_markdown}
+---
+[/SYSTEM INJECTED CONTEXT]
 
-## User's Question
+User's Question: {question}
+"""
 
-{question}
+CONVERSATIONAL_PROMPT_TEMPLATE = """[SYSTEM INJECTED CONTEXT]
+---
+ARCHIVE SUMMARY OF OLDER CONVERSATION:
+{session_summary}
+---
+[/SYSTEM INJECTED CONTEXT]
+
+User's Question: {question}
 """
 
 
-# ── Rolling Summary Prompts ──────────────────────────────────
+# ── Query Intent Router ──────────────────────────────────────
 
-SUMMARY_SYSTEM_PROMPT = """You are an expert conversation summarizer. Your job is to maintain a running summary of a legal consultation between a user and the AdvoAI legal assistant.
+ROUTER_SYSTEM_PROMPT = """You are an intent classification and search query formulation router for AdvoAI, a legal assistant.
+Classify the user's query into one of two categories:
+1. "conversational": Casual greetings, chitchat, or simple follow-ups closely related to previous answers (e.g., "Hello", "Thanks", "Can you clarify that?", "What do you mean by that?"). If the query does NOT introduce a net-new legal concept requiring a fresh database search, it MUST be flagged as conversational.
+2. "legal_rag": Questions requiring factual legal knowledge, document lookups, or advice about Uzbekistan law (e.g., "What is a contract?", "Tell me about penalties", "Article 15").
+
+If the question asks for general knowledge, basic definitions of standard legal terms (things like which are taught, for example, in schools) (e.g., "What is a constitution?", "What is a civil code?", "Define a contract"), or doesn't explicitly require querying Uzbekistan's specific laws, it MUST be flagged as "conversational".
+
+If the intent is "legal_rag", you must also act as a legal researcher and formulate the optimal semantic search query to query a vector database. Extract keywords, synonyms, and core legal concepts from the user's question to maximize retrieval accuracy.
+
+You MUST return a raw JSON object and nothing else. NEVER attempt to make external tool calls, function calls, or output XML tags representing a tool.
+
+Format:
+For conversational: {"intent": "conversational"}
+For RAG: {"intent": "legal_rag", "search_query": "optimal keywords for semantic search..."}
+"""
+
+# ── Archive Shift Summarization ──────────────────────────────
+
+SUMMARY_SYSTEM_PROMPT = """You are an expert conversation summarizer. Your job is to maintain an archive summary of a legal consultation.
+You will be given the existing summary and a set of old messages that are falling out of the sliding window.
 
 Rules:
-1. Produce a concise summary (max 300 words) that captures:
-   - Key legal topics discussed
-   - Specific articles, laws, or regulations mentioned
-   - The user's main questions and concerns
-   - Important conclusions or advice given
-2. Integrate new information into the existing summary seamlessly.
-3. Drop redundant or superseded details.
-4. Keep the summary factual — no opinions or interpretations.
-5. Write in the same language as the conversation.
+1. Integrate the new old messages into the existing summary seamlessly.
+2. Keep it concise, capturing the main legal topics, questions, and advice given.
+3. Write in the same language as the conversation.
+4. Output ONLY the summary text.
 """
 
-SUMMARY_USER_PROMPT_TEMPLATE = """## Current Conversation Summary
+SUMMARY_USER_PROMPT_TEMPLATE = """## Current Archive Summary
 
 {previous_summary}
 
 ---
 
-## New Exchange
+## Old Messages to Archive
 
-**User:** {user_message}
-
-**AdvoAI:** {ai_response}
+{old_messages}
 
 ---
 
-Please produce an UPDATED summary that integrates the new exchange into the existing summary. Keep it concise and factual.
+Please produce an UPDATED archive summary that integrates these old messages into the existing summary.
 """
 
-SUMMARY_FIRST_MESSAGE_TEMPLATE = """## New Exchange
+SUMMARY_FIRST_MESSAGE_TEMPLATE = """## Old Messages to Archive
 
-**User:** {user_message}
-
-**AdvoAI:** {ai_response}
+{old_messages}
 
 ---
 
-Please produce a brief summary of this initial exchange. Keep it concise and factual.
+Please produce a brief summary of these messages. Keep it concise and factual.
 """
-
 
 # ── Chat Title Generation ────────────────────────────────────
 

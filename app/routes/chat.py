@@ -1,16 +1,15 @@
 """
 chat.py — RAG Chat API Route
 
-Receives a user's question, triggers the full Vector Search
-and Parent Document Retrieval pipeline, asks Gemini with
-conversation context (rolling summary), and returns the
-grounded answer.
+Receives a user's question, determines intent (conversational vs RAG),
+runs the pipeline, maintains a Hybrid Sliding Window chat history,
+and returns the grounded answer.
 """
 
 import logging
 from typing import Optional, Dict, Any
 
-from fastapi import APIRouter, HTTPException, Depends, Request
+from fastapi import APIRouter, HTTPException, Depends, Request, BackgroundTasks
 from pydantic import BaseModel, Field
 
 from app.services.rag_pipeline import retrieve_context
@@ -19,6 +18,7 @@ from app.middleware import require_rate_limit, get_current_user
 from app.database.queries import (
     get_session_by_id, update_session_summary,
     create_session, rename_session,
+    insert_message, get_session_messages, delete_oldest_message
 )
 
 router = APIRouter()
@@ -28,68 +28,122 @@ logger = logging.getLogger(__name__)
 class ChatRequest(BaseModel):
     question: str = Field(..., min_length=2, description="The legal question to ask AdvoAI.")
     session_id: Optional[str] = Field(default=None, description="Chat session ID for conversation continuity.")
-    top_k: int = Field(default=5, ge=1, le=10, description="Number of vector chunks to retrieve.")
+    top_k: int = Field(default=5, description="Number of chunks to retrieve.")
 
-
-@router.post("/")
-async def ask_advoai(
-    request: ChatRequest,
-    http_request: Request,
-    user: Optional[Dict[str, Any]] = Depends(require_rate_limit),
+def _background_history_maintenance(
+    session_id: str,
+    question: str,
+    client: Any,
+    recent_messages: list,
+    session_summary: str
 ):
     """
-    Core RAG chatbot endpoint with rolling summary memory.
+    Runs in the background to summarize the sliding window and generate session titles,
+    preventing long blocking API responses.
+    """
+    try:
+        # Check sliding window size
+        MAX_WINDOW_MESSAGES = 6
+        current_messages = get_session_messages(session_id, limit=100)
+        
+        if len(current_messages) > MAX_WINDOW_MESSAGES:
+            dropped_messages = []
+            while len(current_messages) > MAX_WINDOW_MESSAGES:
+                oldest = delete_oldest_message(session_id)
+                if oldest:
+                    dropped_messages.append(oldest)
+                    current_messages.pop(0)
+            
+            if dropped_messages:
+                dropped_text = "\n\n".join(
+                    f"{msg['role'].capitalize()}: {msg['content']}" 
+                    for msg in dropped_messages
+                )
+                new_summary = client.summarize_archive(
+                    old_messages=dropped_text,
+                    previous_summary=session_summary
+                )
+                update_session_summary(session_id, new_summary)
 
-    Flow:
-    1. Check rate limits (guest/free/admin)
-    2. Fetch existing rolling summary from session (if any)
-    3. Run RAG retrieval pipeline
-    4. Generate answer with Gemini (including conversation context)
-    5. Generate updated rolling summary
-    6. Save summary to DB
-    7. Auto-generate session title on first message
+        # Auto-title on first message
+        if not recent_messages:  # If it was empty before this query
+            try:
+                title = client.generate_title(question)
+                rename_session(session_id, title)
+            except Exception as te:
+                logger.warning(f"Title generation failed: {te}")
+
+    except Exception as se:
+        logger.warning(f"History update background task failed: {se}")
+
+@router.post("/", response_model=Dict[str, Any])
+def ask_advoai(
+    request: ChatRequest,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(require_rate_limit)
+):
+    """
+    Core RAG chatbot endpoint with Hybrid History.
     """
     try:
         logger.info(f"Processing chat request: {request.question[:50]}...")
 
-        # ── 1. Resolve session & fetch rolling summary ───────
+        client = get_llm_client()
+
+        # ── 1. Resolve session & fetch hybrid history ───────
         session = None
-        conversation_summary = ""
+        session_summary = ""
+        recent_messages = []
 
         if request.session_id and user:
             session = get_session_by_id(request.session_id)
             if session and session["user_id"] != user["id"]:
                 raise HTTPException(status_code=403, detail="Access denied to this session.")
-            if session:
-                conversation_summary = session.get("rolling_summary", "")
         elif user and not request.session_id:
-            # Auto-create a session for authenticated users
             session = create_session(user["id"])
             logger.info(f"Auto-created session: {session['id']}")
 
-        # ── 2. RAG retrieval pipeline ────────────────────────
-        rag_result = retrieve_context(
-            question=request.question,
-            top_k=request.top_k,
-        )
+        session_id = session["id"] if session else None
 
-        # Guard: no documents found
-        if not rag_result["parent_documents"]:
-            return {
-                "answer": "I couldn't find any relevant legal documents in my database to answer this question. Please try rephrasing or asking about a different topic.",
-                "sources": [],
-                "citations": [],
-                "session_id": session["id"] if session else None,
-                "chunks_used": 0,
-            }
+        if session_id:
+            session_summary = session.get("session_summary", "")
+            recent_messages = get_session_messages(session_id, limit=5)
 
-        # ── 3. Generate answer with Gemini ───────────────────
+        # ── 2. Intent Routing ───────────────────────────────
+        routing_data = client.route_query(request.question)
+        intent = routing_data.get("intent", "legal_rag")
+        search_query = routing_data.get("search_query", request.question)
+        
+        is_conversational = (intent == "conversational")
+        logger.info(f"Query routed as: {intent} | Optimized Search Query: {search_query}")
+
+        # ── 3. RAG retrieval pipeline (if needed) ───────────
+        rag_result = {}
+        if not is_conversational:
+            rag_result = retrieve_context(
+                question=search_query,
+                top_k=request.top_k,
+            )
+
+            # Guard: no documents found
+            if not rag_result.get("parent_documents"):
+                return {
+                    "answer": "I couldn't find any relevant legal documents in my database to answer this question. Please try rephrasing or asking about a different topic.",
+                    "sources": [],
+                    "citations": [],
+                    "session_id": session_id,
+                    "chunks_used": 0,
+                    "intent": intent,
+                }
+
+        # ── 4. Generate answer with Main LLM ────────────────
         try:
-            client = get_llm_client()
             llm_result = client.ask(
-                question=rag_result["question"],
-                context_markdown=rag_result["context_markdown"],
-                conversation_summary=conversation_summary,
+                question=request.question,
+                structured_history=recent_messages,
+                context_markdown=rag_result.get("context_markdown", ""),
+                session_summary=session_summary,
+                is_conversational=is_conversational,
             )
         except (OSError, ConnectionError) as net_err:
             logger.error(f"LLM network error (DNS/connection): {net_err}")
@@ -98,53 +152,54 @@ async def ask_advoai(
                 detail="Unable to reach the AI service. Please check your internet connection and try again."
             )
 
-        # ── 4. Update rolling summary (async-friendly) ───────
-        if session and user:
+        # ── 5. Update Hybrid History (Archive Shift) ────────
+        if session_id:
             try:
-                updated_summary = client.summarize(
-                    user_message=request.question,
-                    ai_response=llm_result["answer"],
-                    previous_summary=conversation_summary,
-                )
-                update_session_summary(session["id"], updated_summary)
+                # Save the new exchange to sliding window
+                insert_message(session_id, "user", request.question)
+                insert_message(session_id, "assistant", llm_result["answer"])
 
-                # Auto-title on first message (when summary was empty)
-                if not conversation_summary:
-                    try:
-                        title = client.generate_title(request.question)
-                        rename_session(session["id"], title)
-                    except Exception as te:
-                        logger.warning(f"Title generation failed: {te}")
+                # Check sliding window size and summarize in background
+                background_tasks.add_task(
+                    _background_history_maintenance,
+                    session_id=session_id,
+                    question=request.question,
+                    client=client,
+                    recent_messages=recent_messages,
+                    session_summary=session_summary
+                )
 
             except Exception as se:
-                logger.warning(f"Summary update failed (non-fatal): {se}")
+                logger.warning(f"Message insert failed (non-fatal): {se}")
 
-        # ── 5. Format response for frontend ──────────────────
-        # Citations = deduplicated parent documents (not individual chunks)
+        # ── 6. Format response for frontend ─────────────────
         safe_citations = []
-        seen_doc_ids = set()
-        for doc in rag_result["parent_documents"]:
-            doc_id = doc.get("source_doc_id", doc["id"])
-            if doc_id in seen_doc_ids:
-                continue
-            seen_doc_ids.add(doc_id)
-            safe_citations.append({
-                "id": doc_id,
-                "title": doc.get("title", "Untitled Document"),
-                "source_url": doc.get("source_url", "#"),
-                "text": doc.get("full_markdown") or "",  # full content for the insight panel
-            })
+        if not is_conversational:
+            seen_doc_ids = set()
+            for doc in rag_result.get("parent_documents", []):
+                # doc contains 'source_doc_id', 'title', 'full_markdown'
+                doc_id = doc.get("source_doc_id")
+                if doc_id in seen_doc_ids:
+                    continue
+                seen_doc_ids.add(doc_id)
+                safe_citations.append({
+                    "id": doc_id,
+                    "title": doc.get("title", "Untitled Document Part"),
+                    "source_url": doc.get("source_url", "#"),
+                    "text": doc.get("full_markdown") or "", 
+                })
 
         return {
             "answer": llm_result["answer"],
             "model_used": llm_result["model"],
             "citations": safe_citations,
-            "session_id": session["id"] if session else None,
+            "session_id": session_id,
+            "intent": intent,
             "metadata": {
                 "context_length_chars": llm_result["context_length"],
                 "prompt_length_chars": llm_result["prompt_length"],
-                "chunks_used": len(rag_result["matched_chunks"]),
-                "documents_used": len(rag_result["parent_documents"]),
+                "chunks_used": len(rag_result.get("matched_chunks", [])),
+                "documents_used": len(rag_result.get("parent_documents", [])),
             },
         }
 
@@ -156,4 +211,3 @@ async def ask_advoai(
     except Exception as e:
         logger.error(f"Chat API error: {e}")
         raise HTTPException(status_code=500, detail="An error occurred while processing your request.")
-

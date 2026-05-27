@@ -2,9 +2,7 @@
 main_ingest.py — Ingestion Pipeline Orchestrator
 
 End-to-end ingestion of Lex.uz legal documents:
-    fetch → parse → chunk → embed → save to database
-
-Uses GeminiEmbedder (gemini-embedding-2, 1536-dim) for vector generation.
+    fetch → parse → split into mega-chunks → chunk → embed → save to database
 """
 
 import logging
@@ -16,41 +14,81 @@ from typing import Dict, List, Any, Optional
 from app.ingestion.lex_parser import LexParser
 from app.ingestion.chunker import LegalUnstructuredChunker
 from app.services.embedder import get_embedder
-from app.database.queries import check_duplicate, insert_document, insert_chunks
+from app.database.queries import check_duplicate, insert_document, insert_document_parts, insert_chunks
 from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Constants for Dynamic Mega-Chunking
+MAX_PART_SIZE = 100_000
+TARGET_SPLIT_SIZE = 60_000
 
 # ── Helpers ───────────────────────────────────────────────────
 
 def _extract_source_doc_id(url: str) -> Optional[str]:
     """
     Extracts the numeric document ID from a Lex.uz URL.
-
-    Handles all URL variants:
-        https://lex.uz/docs/-111189      -> '111189'
-        https://lex.uz/docs/111189       -> '111189'
-        https://lex.uz/en/docs/-7904841  -> '7904841'
     """
     match = re.search(r"/docs/-?(\d+)", url)
     return match.group(1) if match else None
 
+def _split_markdown_into_parts(markdown: str, title: str, doc_uuid: str) -> List[Dict[str, Any]]:
+    """Splits a massive markdown document into 60k character Mega-Chunks."""
+    if len(markdown) <= MAX_PART_SIZE:
+        return [{
+            "id": str(uuid.uuid4()),
+            "document_id": doc_uuid,
+            "part_title": title,
+            "text": markdown,
+            "part_index": 0
+        }]
+    
+    parts = []
+    current_idx = 0
+    part_idx = 0
+    
+    while current_idx < len(markdown):
+        end_idx = current_idx + TARGET_SPLIT_SIZE
+        if end_idx >= len(markdown):
+            parts.append({
+                "id": str(uuid.uuid4()),
+                "document_id": doc_uuid,
+                "part_title": f"{title} (Part {part_idx + 1})",
+                "text": markdown[current_idx:].strip(),
+                "part_index": part_idx
+            })
+            break
+            
+        # Try to find a clean break (double newline)
+        clean_break = markdown.find("\n\n", end_idx)
+        if clean_break != -1 and clean_break - end_idx < 10000:
+            end_idx = clean_break
+        else:
+            # Fallback backward search
+            clean_break = markdown.rfind("\n\n", current_idx, end_idx)
+            if clean_break != -1 and clean_break > current_idx:
+                end_idx = clean_break
+                
+        part_text = markdown[current_idx:end_idx].strip()
+        if part_text:
+            parts.append({
+                "id": str(uuid.uuid4()),
+                "document_id": doc_uuid,
+                "part_title": f"{title} (Part {part_idx + 1})",
+                "text": part_text,
+                "part_index": part_idx
+            })
+            part_idx += 1
+            
+        current_idx = end_idx
+        
+    return parts
 
 # ── Main Pipeline ─────────────────────────────────────────────
 
 def process_and_ingest_law(url: str, skip_db: bool = False) -> Optional[Dict[str, Any]]:
     """
     End-to-end ingestion of a single Lex.uz legal document.
-
-    Pipeline:  fetch -> parse -> chunk -> embed -> save to DB
-
-    Args:
-        url:     A Lex.uz document URL (e.g. https://lex.uz/en/docs/-7904841)
-        skip_db: If True, skip database writes (useful for testing without DB)
-
-    Returns:
-        Dictionary with 'parent_document' and 'search_chunks', or None on failure.
     """
     logger.info("=" * 60)
     logger.info("ADVOAI INGESTION PIPELINE")
@@ -81,12 +119,12 @@ def process_and_ingest_law(url: str, skip_db: bool = False) -> Optional[Dict[str
     )
     logger.info(f"Markdown: {len(markdown):,} chars, {markdown.count(chr(10)):,} lines")
 
-    # Step 3: Generate UUID and build parent document record
+    # Step 3: Generate UUID and build ROOT document record
     doc_uuid: str = str(uuid.uuid4())
     doc_title: str = metadata.get("title", "Unknown")
-    logger.info(f"UUID (PK): {doc_uuid}")
+    logger.info(f"UUID (Root PK): {doc_uuid}")
 
-    parent_document_record: Dict[str, Any] = {
+    root_document_record: Dict[str, Any] = {
         "id": doc_uuid,
         "source_doc_id": source_doc_id,
         "title": doc_title,
@@ -94,55 +132,56 @@ def process_and_ingest_law(url: str, skip_db: bool = False) -> Optional[Dict[str
         "doc_date": metadata.get("doc_date"),
         "source_url": url.split("?")[0],
         "is_active": metadata.get("is_active", True),
-        "full_markdown": markdown,
     }
 
-    # Step 4: Chunk cleaned HTML for search index
-    cleaned_html: Optional[str] = str(parser.soup)
-    if not cleaned_html:
-        logger.error("Pipeline aborted: no cleaned HTML available.")
-        return None
+    # Step 4: Split into Mega-Chunks (document_parts)
+    document_parts = _split_markdown_into_parts(markdown, doc_title, doc_uuid)
+    logger.info(f"Split document into {len(document_parts)} Mega-Chunks (Parts).")
 
+    # Step 5: Chunk the Markdown parts for vector search
     chunker = LegalUnstructuredChunker(max_characters=1000, combine_text_under_n_chars=200)
-    search_chunks: List[Dict[str, Any]] = chunker.chunk_html(cleaned_html, doc_uuid)
+    all_search_chunks: List[Dict[str, Any]] = []
+    
+    for part in document_parts:
+        part_chunks = chunker.chunk_markdown(part["text"], document_part_id=part["id"])
+        all_search_chunks.extend(part_chunks)
 
-    # Step 5: Generate embeddings via Gemini Embedding 2
+    # Step 6: Generate embeddings
     embedder = get_embedder()
-    # Pass the document title for better retrieval quality (used in task prompt)
-    search_chunks = embedder.embed_chunks(search_chunks, doc_title=doc_title)
+    # Note: passing doc_title helps gemini embeddings contextualize the chunk
+    all_search_chunks = embedder.embed_chunks(all_search_chunks, doc_title=doc_title)
 
-    # Step 6: Save to database
+    # Step 7: Save to database
     if not skip_db:
         logger.info("Saving to database...")
-        insert_document(parent_document_record)
-        insert_chunks(search_chunks)
+        insert_document(root_document_record)
+        insert_document_parts(document_parts)
+        insert_chunks(all_search_chunks)
     else:
         logger.info("Skipping DB writes (skip_db=True)")
 
-    # Step 7: Verify and summarize
-    linked_ok = all(c["parent_id"] == doc_uuid for c in search_chunks)
+    # Step 8: Verify and summarize
     embedded_ok = all(
         "embedding" in c and len(c["embedding"]) == settings.EMBEDDING_DIMENSIONS
-        for c in search_chunks
+        for c in all_search_chunks
     )
 
     logger.info("-" * 60)
     logger.info("INGESTION SUMMARY")
     logger.info(f"  Document:    {doc_title[:50]}")
-    logger.info(f"  UUID (PK):   {doc_uuid}")
+    logger.info(f"  Root UUID:   {doc_uuid}")
     logger.info(f"  Source ID:   {source_doc_id}")
-    logger.info(f"  Date:        {metadata.get('doc_date', 'N/A')}")
-    logger.info(f"  Act type:    {metadata.get('act_type', 'N/A')}")
     logger.info(f"  Markdown:    {len(markdown):,} chars")
-    logger.info(f"  Chunks:      {len(search_chunks)}")
+    logger.info(f"  Mega-Chunks: {len(document_parts)} parts")
+    logger.info(f"  Vector Chnks:{len(all_search_chunks)}")
     logger.info(f"  Embedded:    {'OK' if embedded_ok else 'FAILED'} ({settings.EMBEDDING_DIMENSIONS}-dim)")
-    logger.info(f"  Linkage:     {'OK' if linked_ok else 'FAILED'}")
     logger.info(f"  Saved to DB: {'Yes' if not skip_db else 'Skipped'}")
     logger.info("-" * 60)
 
     return {
-        "parent_document": parent_document_record,
-        "search_chunks": search_chunks,
+        "parent_document": root_document_record,
+        "document_parts": document_parts,
+        "search_chunks": all_search_chunks,
     }
 
 
@@ -153,6 +192,9 @@ if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv()
     _logging.basicConfig(level=_logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+    from app.database.connection import init_pool
+    init_pool()
 
     arg_parser = argparse.ArgumentParser(description="AdvoAI Ingestion Pipeline")
     arg_parser.add_argument("--url", type=str, default="https://lex.uz/en/docs/-7904841", help="Document URL to ingest")

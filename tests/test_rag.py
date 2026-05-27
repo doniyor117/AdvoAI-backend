@@ -1,32 +1,63 @@
-"""
-test_rag.py — Simple integration tests for the new Gemini RAG pipeline.
-"""
 import pytest
-from app.services.embedder import GeminiEmbedder
-from app.services.llm_client import GeminiClient
+from unittest.mock import patch, MagicMock
+from app.services.rag_pipeline import retrieve_context
 
-def test_embedder_initialization():
-    embedder = GeminiEmbedder()
-    assert embedder.model == "gemini-embedding-2"
-    assert embedder.dimensions == 1536
-
-def test_embed_query_mock(monkeypatch):
-    embedder = GeminiEmbedder()
+@patch('app.services.rag_pipeline.get_embedder')
+@patch('app.services.rag_pipeline.search_similar_chunks')
+@patch('app.services.rag_pipeline.fetch_document_parts')
+def test_retrieve_context(mock_fetch, mock_search, mock_embedder):
+    # Mocking embedder
+    mock_embed_instance = MagicMock()
+    mock_embed_instance.embed_query.return_value = [0.1, 0.2, 0.3]
+    mock_embedder.return_value = mock_embed_instance
     
-    # Mock the internal client response
-    class MockResponse:
-        def __init__(self):
-            self.embeddings = [type('obj', (object,), {'values': [0.1] * 1536})]
-            
-    def mock_embed_content(*args, **kwargs):
-        return MockResponse()
-        
-    monkeypatch.setattr(embedder.client.models, "embed_content", mock_embed_content)
+    # Mocking search results
+    mock_search.return_value = [
+        {"document_part_id": "part_1", "similarity": 0.95},
+        {"document_part_id": "part_1", "similarity": 0.90},  # Duplicate Mega-Chunk
+        {"document_part_id": "part_2", "similarity": 0.85}
+    ]
     
-    vector = embedder.embed_query("How do I register a company?")
-    assert len(vector) == 1536
-    assert vector[0] == 0.1
+    # Mocking fetched parents
+    mock_fetch.return_value = [
+        {"source_doc_id": "doc_1", "title": "Test Title 1", "full_markdown": "Full mega-chunk 1 text"},
+        {"source_doc_id": "doc_2", "title": "Test Title 2", "full_markdown": "Full mega-chunk 2 text"}
+    ]
+    
+    result = retrieve_context("What is the civil code?", top_k=3)
+    
+    # Assert query embedded
+    mock_embed_instance.embed_query.assert_called_once_with("What is the civil code?")
+    
+    # Assert search called
+    mock_search.assert_called_once_with([0.1, 0.2, 0.3], top_k=3)
+    
+    # Assert deduplication: part_1 is matched twice, but we should only fetch unique parts
+    fetch_args = mock_fetch.call_args[0][0]
+    assert len(fetch_args) == 2
+    assert "part_1" in fetch_args
+    assert "part_2" in fetch_args
+    
+    # Assert output formatting
+    assert result["question"] == "What is the civil code?"
+    assert len(result["matched_chunks"]) == 3
+    assert len(result["parent_documents"]) == 2
+    assert "Full mega-chunk 1 text" in result["context_markdown"]
+    assert "Full mega-chunk 2 text" in result["context_markdown"]
 
-def test_llm_client_initialization():
-    client = GeminiClient(model_name="gemini-2.5-flash")
-    assert client.model_name == "gemini-2.5-flash"
+@patch('app.services.rag_pipeline.get_embedder')
+@patch('app.services.rag_pipeline.search_similar_chunks')
+@patch('app.services.rag_pipeline.fetch_document_parts')
+def test_retrieve_context_no_results(mock_fetch, mock_search, mock_embedder):
+    mock_embed_instance = MagicMock()
+    mock_embed_instance.embed_query.return_value = [0.1]
+    mock_embedder.return_value = mock_embed_instance
+    
+    mock_search.return_value = []
+    
+    result = retrieve_context("Unknown question", top_k=5)
+    
+    assert len(result["matched_chunks"]) == 0
+    assert len(result["parent_documents"]) == 0
+    assert result["context_markdown"] == ""
+    mock_fetch.assert_called_once_with([])

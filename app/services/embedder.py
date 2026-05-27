@@ -1,120 +1,195 @@
 """
-embedder.py — Legal Text Embedder (CPU-optimized)
+embedder.py — Gemini Embedding 2 Service
 
-Wraps the BGE-M3 model to generate 1024-dimensional dense vectors
-for legal document chunks. Runs on CPU — no GPU required.
+Wraps Google's gemini-embedding-2 API to generate 1536-dimensional
+dense vectors for legal document chunks and search queries.
 
-Usage:
-    from app.services.embedder import LegalEmbedder
+Key differences from the old BGE-M3 approach:
+  - Zero local compute: no model download, no torch, no GPU
+  - Uses inline task instructions in the prompt (not task_type parameter)
+  - Query format:    "task: question answering | query: {text}"
+  - Document format: "title: {title} | text: {content}"
+  - Each chunk wrapped in Content() to get individual embeddings
+  - 8,192 token input limit (vs BGE-M3's 2,048)
+  - Auto-normalization for non-default dimensions
 
-    embedder = LegalEmbedder(device="cpu")  # or "gpu"
-    chunks_with_embeddings = embedder.embed_chunks(chunks)
+Ref: https://ai.google.dev/gemini-api/docs/embeddings
 """
 
-import os
-import torch
-from FlagEmbedding import BGEM3FlagModel
-from typing import List, Dict, Any
+import logging
 from functools import lru_cache
+from typing import List, Dict, Any
+
+from google import genai
+from google.genai import types
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 
-class LegalEmbedder:
+class GeminiEmbedder:
     """
-    Wraps BGE-M3 to generate 1024-dim dense vectors for legal chunks.
-    Forces CPU execution to avoid incompatible GPU issues.
+    Wraps gemini-embedding-2 to generate 1536-dim dense vectors.
+    Uses the same GOOGLE_API_KEY already configured for the LLM client.
     """
 
-    def __init__(self, device: str = "cpu"):
-        """
-        Initialize the embedder.
-        Args:
-            device: 'cpu' (default, safe for conflicting GPUs) or 'gpu'.
-        """
-        self.device = device.lower()
-
-        if self.device == "cpu":
-            # Force CPU — avoids issues with incompatible GPUs (e.g. MX330 = CUDA 6.1)
-            os.environ["CUDA_VISIBLE_DEVICES"] = ""
-            use_fp16 = False
-            device_str = "cpu"
-        else:
-            # GPU Mode
-            use_fp16 = True
-            device_str = None  # None lets FlagEmbedding auto-detect GPU
-
-        print(f"🧠 Loading BGE-M3 model ({self.device.upper()} mode)...")
-        self.model = BGEM3FlagModel(
-            'BAAI/bge-m3',
-            use_fp16=use_fp16,
-            device=device_str,
-            # Prevent network timeouts by forcing it to use the downloaded cache
-            # local_files_only=True is supported by default in hf_hub
+    def __init__(self):
+        self.client = genai.Client(api_key=settings.GOOGLE_API_KEY)
+        self.model = settings.EMBEDDING_MODEL         # "gemini-embedding-2"
+        self.dimensions = settings.EMBEDDING_DIMENSIONS  # 1536
+        logger.info(
+            f"GeminiEmbedder initialized: model={self.model}, dimensions={self.dimensions}"
         )
-        print("✅ Model loaded.")
 
-    def embed_chunks(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def embed_query(self, text: str) -> List[float]:
         """
-        Takes chunk dicts, embeds the text field, and attaches vectors.
+        Embeds a user search query.
+
+        Uses "task: question answering" prefix per gemini-embedding-2 docs.
+        This asymmetric format optimises the query vector for retrieval.
 
         Args:
-            chunks: List of dicts with at least a 'text' key.
+            text: The user's legal question.
 
         Returns:
-            Same list with 'embedding' key added (list of 1024 floats).
+            List of floats (length = settings.EMBEDDING_DIMENSIONS).
+        """
+        formatted = f"task: question answering | query: {text}"
+        result = self.client.models.embed_content(
+            model=self.model,
+            contents=formatted,
+            config=types.EmbedContentConfig(
+                output_dimensionality=self.dimensions
+            ),
+        )
+        return list(result.embeddings[0].values)
+
+    def embed_chunks(
+        self,
+        chunks: List[Dict[str, Any]],
+        doc_title: str = "none",
+    ) -> List[Dict[str, Any]]:
+        """
+        Embeds a list of document chunks.
+
+        Uses document format: "title: {title} | text: {content}"
+        Each chunk is wrapped in a Content object so the API returns
+        individual embeddings (not a single aggregated one).
+
+        Args:
+            chunks:    List of dicts with at least a 'text' key.
+            doc_title: The parent document title (improves retrieval quality).
+
+        Returns:
+            Same list with 'embedding' key added (list of 1536 floats).
         """
         if not chunks:
             return []
 
-        print(f"🪄 Generating embeddings for {len(chunks)} chunks...")
+        logger.info(f"Generating embeddings for {len(chunks)} chunks (model={self.model})...")
 
-        texts: List[str] = [chunk["text"] for chunk in chunks]
+        # Wrap each chunk in a Content object → individual embeddings per chunk
+        contents = [
+            types.Content(
+                parts=[types.Part(
+                    text=f"title: {doc_title} | text: {chunk['text']}"
+                )]
+            )
+            for chunk in chunks
+        ]
+
+        # Google Gemini API has a hard limit of 100 requests per batch.
+        batch_size = 100
+        all_embeddings = []
 
         try:
-            # max_length is in TOKENS (not chars). BGE-M3 supports up to 8192.
-            # batch_size=12 is safe for CPU. Reduce if you hit memory issues.
-            output = self.model.encode(
-                texts,
-                batch_size=12,
-                max_length=1024,
-                return_dense=True,
-                return_sparse=False,
-                return_colbert_vecs=False
-            )
+            for i in range(0, len(contents), batch_size):
+                batch_contents = contents[i:i + batch_size]
+                logger.debug(f"Embedding batch {i // batch_size + 1} of {(len(contents) - 1) // batch_size + 1}...")
+
+                retries = 5
+                backoff = 30
+                for attempt in range(retries):
+                    try:
+                        result = self.client.models.embed_content(
+                            model=self.model,
+                            contents=batch_contents,
+                            config=types.EmbedContentConfig(
+                                output_dimensionality=self.dimensions
+                            ),
+                        )
+                        for e in result.embeddings:
+                            all_embeddings.append(list(e.values))
+                        break  # Batch succeeded, proceed to next batch
+                    except Exception as err:
+                        err_str = str(err)
+                        if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                            if attempt == retries - 1:
+                                raise
+                            
+                            # Determine sleep time (parse Google API's suggested retry window if present)
+                            sleep_seconds = backoff
+                            import re
+                            # Try matching 'retryDelay': '44s' or 'retryDelay: "44s"'
+                            match = re.search(r"retryDelay['\"]:\s*['\"](\d+)s['\"]", err_str)
+                            if match:
+                                sleep_seconds = int(match.group(1)) + 2  # add safety buffer
+                            else:
+                                # Try matching 'Please retry in 44.2297s'
+                                match_float = re.search(r"retry in (\d+\.?\d*)s", err_str)
+                                if match_float:
+                                    sleep_seconds = int(float(match_float.group(1))) + 2
+                            
+                            logger.warning(
+                                f"Gemini API rate limit (429) hit. Sleeping for {sleep_seconds}s before retrying batch {i // batch_size + 1} (attempt {attempt + 1}/{retries})..."
+                            )
+                            import time
+                            time.sleep(sleep_seconds)
+                            backoff *= 2  # Double the backoff window for next attempt
+                        else:
+                            raise
+
         except Exception as err:
-            print(f"❌ Embedding failed: {err}")
+            logger.error(f"Embedding API call failed: {err}")
             raise
 
-        dense_vectors = output['dense_vecs']
-
-        # Attach vectors to chunks (convert numpy → Python list for pgvector)
         for i, chunk in enumerate(chunks):
-            chunk["embedding"] = dense_vectors[i].tolist()
+            chunk["embedding"] = all_embeddings[i]
 
-        print(f"✅ Embedded {len(chunks)} chunks ({len(dense_vectors[0])}-dim)")
+        logger.info(
+            f"Embedded {len(chunks)} chunks ({self.dimensions}-dim)"
+        )
         return chunks
 
 
 @lru_cache(maxsize=1)
-def get_embedder(device: str = "cpu") -> LegalEmbedder:
+def get_embedder() -> GeminiEmbedder:
     """
-    Returns a cached Singleton instance of the embedder.
-    Prevents loading the 2.5GB model into RAM on every single request.
+    Returns a cached singleton GeminiEmbedder.
+    Safe to call multiple times — only one client is created.
     """
-    return LegalEmbedder(device=device)
+    return GeminiEmbedder()
 
 
 # ── Test ──────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Mock chunks matching chunker.py output format
+    from dotenv import load_dotenv
+    load_dotenv()
+
     mock_chunks = [
         {"id": "aaa-111", "text": "The penalty for theft is up to 3 years.", "parent_id": "doc-uuid-1"},
-        {"id": "bbb-222", "text": "Taxes must be paid by the end of the fiscal year.", "parent_id": "doc-uuid-1"}
+        {"id": "bbb-222", "text": "Taxes must be paid by the end of the fiscal year.", "parent_id": "doc-uuid-1"},
     ]
 
-    embedder = LegalEmbedder()
-    embedded = embedder.embed_chunks(mock_chunks)
+    embedder = get_embedder()
 
-    print(f"\n📐 Dimensions: {len(embedded[0]['embedding'])}")   # Should be 1024
-    print(f"🔢 First 5 values: {embedded[0]['embedding'][:5]}")
-    print(f"🔗 Parent ID preserved: {embedded[0]['parent_id']}")
+    print("\n--- Testing embed_chunks ---")
+    embedded = embedder.embed_chunks(mock_chunks, doc_title="Criminal Code of Uzbekistan")
+    print(f"Dimensions: {len(embedded[0]['embedding'])}")  # Should be 1536
+    print(f"First 5 values: {embedded[0]['embedding'][:5]}")
+
+    print("\n--- Testing embed_query ---")
+    q_vec = embedder.embed_query("What is the punishment for theft?")
+    print(f"Query embedding dimensions: {len(q_vec)}")

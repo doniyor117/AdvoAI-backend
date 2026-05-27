@@ -1,4 +1,4 @@
 # Routes Module
-from app.routes import health, ingest, chat
+from app.routes import health, chat
 
-__all__ = ["health", "ingest", "chat"]
+__all__ = ["health", "chat"]

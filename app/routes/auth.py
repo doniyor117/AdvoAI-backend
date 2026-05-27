@@ -65,7 +65,7 @@ def _set_auth_cookie(response: Response, user_id: str) -> str:
     token = create_access_token({"sub": user_id})
     is_production = settings.ENVIRONMENT != "development"
     response.set_cookie(
-        key="yurika_token",
+        key="advoai_token",
         value=token,
         httponly=True,
         secure=is_production,
@@ -227,7 +227,7 @@ def logout(response: Response):
     """
     Clears the auth cookie.
     """
-    response.delete_cookie("yurika_token", path="/")
+    response.delete_cookie("advoai_token", path="/")
     return {"message": "Logged out successfully."}
 
 

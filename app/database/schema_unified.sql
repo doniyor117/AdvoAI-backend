@@ -1,5 +1,5 @@
 -- ============================================================
--- Yurika — Comprehensive Database Schema
+-- AdvoAI — Comprehensive Database Schema
 -- PostgreSQL + pgvector (Neon)
 -- Safe to run multiple times (idempotent).
 -- ============================================================
@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS public.chunks
     id              uuid NOT NULL,
     parent_id       uuid NOT NULL,                           -- FK → documents.id
     text            text NOT NULL,
-    embedding       vector(1024),                            -- Nullable: inserted before embedding
+    embedding       vector(1536),                            -- Nullable: inserted before embedding
     chunk_metadata  jsonb,
     created_at      timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id)
@@ -128,7 +128,7 @@ CREATE TABLE IF NOT EXISTS public.system_settings (
 );
 
 INSERT INTO system_settings (key, value) VALUES
-    ('current_llm_model', 'gemini-2.5-flash'),
+    ('current_llm_model', 'gemini-3.1-flash-lite'),
     ('guest_message_limit', '3'),
     ('free_daily_limit', '20')
 ON CONFLICT (key) DO NOTHING;

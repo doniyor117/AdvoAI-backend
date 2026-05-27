@@ -1,84 +1,59 @@
 """
 rag_pipeline.py — RAG Query Pipeline
 
-The "brain" of the Yurika chatbot. Given a user's question:
-    1. Embed the question using BGE-M3
-    2. Search pgvector for the most similar chunks
+The "brain" of the AdvoAI chatbot. Given a user's question:
+    1. Embed the question using Gemini Embedding 2
+    2. Search pgvector for the most similar chunks (HNSW cosine)
     3. Fetch the full parent Markdown documents
-    4. Return the context to send to Gemini
+    4. Return the assembled context to send to Gemini LLM
 
-This is the "Small-to-Big" retrieval strategy:
-    small chunks → accurate vector match → full document → rich LLM context
+"Small-to-Big" retrieval strategy:
+    small chunks → accurate vector match → full parent document → rich LLM context
 """
 
+import logging
 from typing import List, Dict, Any
 
-from app.config import settings
 from app.services.embedder import get_embedder
 from app.database.queries import search_similar_chunks, fetch_parent_documents
 
+logger = logging.getLogger(__name__)
 
-# ── Full RAG Pipeline ─────────────────────────────────────────
 
 def retrieve_context(question: str, top_k: int = 5) -> Dict[str, Any]:
     """
     The complete RAG retrieval pipeline.
 
-    1. Embed the user's question
-    2. Search for similar chunks in pgvector
-    3. Look up the parent documents (full Markdown)
-    4. Return everything the LLM needs
-
     Args:
         question: The user's legal question in natural language.
-        top_k:    Number of chunks to retrieve.
+        top_k:    Number of chunks to retrieve from pgvector.
 
     Returns:
-        Dictionary with 'question', 'matched_chunks', 'parent_documents',
-        and 'context_markdown' (the combined text for Gemini).
+        Dictionary with:
+            - question:         Original question
+            - matched_chunks:   Top-K similar chunks with similarity scores
+            - parent_documents: Unique parent docs (full Markdown)
+            - context_markdown: Combined doc text for the LLM prompt
     """
-    print(f"\n🔍 RAG RETRIEVAL")
-    print(f"   Question: {question[:80]}...")
+    logger.info(f"RAG retrieval | question: {question[:80]}...")
 
-    # Step 1: Embed the question
+    # Step 1: Embed the query via Gemini Embedding 2
     embedder = get_embedder()
-    query_output = embedder.model.encode(
-        [question],
-        batch_size=1,
-        max_length=512,
-        return_dense=True,
-        return_sparse=False,
-        return_colbert_vecs=False
-    )
-    query_embedding = query_output['dense_vecs'][0].tolist()
-    print(f"   ✅ Question embedded ({len(query_embedding)}-dim)")
+    query_embedding = embedder.embed_query(question)
+    logger.info(f"Query embedded ({len(query_embedding)}-dim)")
 
-    # Step 2: Search for similar chunks AND optionally Rerank
-    if settings.USE_RERANKER:
-        print(f"   🔄 Cross-Encoder enabled. Fetching {top_k * 3} chunks for reranking...")
-        # Get a wider net of candidates
-        candidate_chunks = search_similar_chunks(query_embedding, top_k=(top_k * 3))
-        
-        # Lazy load reranker to save RAM if not used
-        from app.services.reranker import get_reranker
-        reranker = get_reranker()
-        
-        # Rerank and narrow down to top_k
-        matched_chunks = reranker.rerank(query=question, chunks=candidate_chunks, top_k=top_k)
-    else:
-        print(f"   ⚡ Fast retrieval enabled (Reranker OFF). Fetching exactly {top_k} chunks...")
-        matched_chunks = search_similar_chunks(query_embedding, top_k=top_k)
-
-    print(f"   ✅ Final matched chunks: {len(matched_chunks)}")
+    # Step 2: Vector search — top-K similar chunks
+    matched_chunks = search_similar_chunks(query_embedding, top_k=top_k)
+    logger.info(f"Matched {len(matched_chunks)} chunks")
 
     if matched_chunks:
-        print(f"   📊 Top similarity: {matched_chunks[0]['similarity']:.4f}")
+        logger.info(f"Top similarity score: {matched_chunks[0]['similarity']:.4f}")
 
-    # Step 3: Get unique parent document IDs (from the top chunks)
+    # Step 3: Get unique parent document IDs
     parent_ids = list(set(chunk["parent_id"] for chunk in matched_chunks))
-    print(f"   📄 Unique parent documents to fetch: {len(parent_ids)}")
+    logger.info(f"Fetching {len(parent_ids)} unique parent documents...")
 
-    # Step 4: Fetch full parent documents
+    # Step 4: Fetch full parent Markdown documents
     parent_documents = fetch_parent_documents(parent_ids)
 
     # Step 5: Combine all parent Markdown into one context string
@@ -86,7 +61,7 @@ def retrieve_context(question: str, top_k: int = 5) -> Dict[str, Any]:
         doc["full_markdown"] for doc in parent_documents
     )
 
-    print(f"   ✅ Context ready: {len(context_markdown):,} chars for Gemini")
+    logger.info(f"Context ready: {len(context_markdown):,} chars")
 
     return {
         "question": question,
@@ -99,16 +74,19 @@ def retrieve_context(question: str, top_k: int = 5) -> Dict[str, Any]:
 # ── Test ──────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    from dotenv import load_dotenv
+    load_dotenv()
+
     test_question = "Какие штрафы предусмотрены за нарушение трудового договора?"
-    print(f"\n🧪 Testing RAG pipeline...\n")
+    print(f"\nTesting RAG pipeline...\n")
 
     result = retrieve_context(test_question, top_k=3)
 
-    print(f"\n📊 Results:")
-    print(f"   Chunks found:    {len(result['matched_chunks'])}")
-    print(f"   Documents found: {len(result['parent_documents'])}")
-    print(f"   Context size:    {len(result['context_markdown']):,} chars")
+    print(f"\nResults:")
+    print(f"  Chunks found:    {len(result['matched_chunks'])}")
+    print(f"  Documents found: {len(result['parent_documents'])}")
+    print(f"  Context size:    {len(result['context_markdown']):,} chars")
 
     if result["matched_chunks"]:
-        print(f"\n🏆 Top match (similarity={result['matched_chunks'][0]['similarity']}):")
-        print(f"   {result['matched_chunks'][0]['text'][:150]}...")
+        print(f"\nTop match (similarity={result['matched_chunks'][0]['similarity']}):")
+        print(f"  {result['matched_chunks'][0]['text'][:150]}...")

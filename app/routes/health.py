@@ -9,7 +9,7 @@ import logging
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
-from app.database.connection import get_connection
+from app.database.connection import get_cursor
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -20,7 +20,7 @@ def health_check():
     """
     Basic health check. Simply verifies the FastAPI server is reachable.
     """
-    return {"status": "online", "message": "Yurika API is running"}
+    return {"status": "online", "message": "AdvoAI API is running"}
 
 
 @router.get("/db")
@@ -32,10 +32,11 @@ def database_health_check():
     message = "Database connection successful."
     
     try:
-        # get_connection() raises an exception if it fails to connect
-        # or if DATABASE_URL is invalid/missing.
-        conn = get_connection()
-        conn.close()
+        # get_cursor() borrows from the pool and automatically returns it.
+        # It will raise an exception if it fails to connect.
+        from contextlib import closing
+        with get_cursor() as cur:
+            cur.execute("SELECT 1")
     except Exception as e:
         status = "unhealthy"
         message = f"Database connection failed: {str(e)}"

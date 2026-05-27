@@ -4,7 +4,7 @@ by re-fetching the title from the source URLs.
 
 Usage:
     conda activate basira_libs
-    cd yurika-backend
+    cd advoai-backend
     python -m scripts.repair_titles
 """
 

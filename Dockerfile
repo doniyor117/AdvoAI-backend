@@ -1,5 +1,5 @@
 # ============================================================
-# Yurika Backend — Hugging Face Space Dockerfile
+# AdvoAI Backend — Hugging Face Space Dockerfile
 # ============================================================
 
 FROM python:3.11-slim

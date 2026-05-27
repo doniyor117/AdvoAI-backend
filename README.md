@@ -1,5 +1,5 @@
 ---
-title: Yurika Backend
+title: AdvoAI Backend
 emoji: ⚖️
 colorFrom: blue
 colorTo: indigo
@@ -10,9 +10,9 @@ app_file: app.py
 pinned: false
 ---
 
-# Yurika Backend
+# AdvoAI Backend
 
-**FastAPI backend powering the Yurika AI Legal Assistant.**
+**FastAPI backend powering the AdvoAI AI Legal Assistant.**
 
 A hybrid Parent-Child RAG (Retrieval-Augmented Generation) system for Uzbekistan's legal documents, backed by PostgreSQL + pgvector and Google Gemini.
 
@@ -47,10 +47,10 @@ The API will be available at `http://localhost:8000`. Interactive docs at `/docs
 app/
 ├── main.py                  # FastAPI app + CORS + route mounting
 ├── config.py                # Pydantic settings loaded from .env
-├── middleware.py             # JWT auth, rate limits, ban enforcement
+├── middleware.py             # JWT auth, role checks
 ├── database/
 │   ├── connection.py         # PostgreSQL connection pool (psycopg2)
-│   ├── queries.py            # All SQL query functions (~600 lines)
+│   ├── queries.py            # All SQL query functions (DRY)
 │   └── schema_unified.sql    # Complete DB schema (idempotent, safe to re-run)
 ├── ingestion/
 │   ├── lex_parser.py         # Lex.uz HTML → structured Markdown
@@ -61,14 +61,13 @@ app/
 │   ├── chat.py               # POST /api/chat/ — RAG chat endpoint
 │   ├── sessions.py           # CRUD for chat sessions
 │   ├── admin.py              # Admin panel APIs (settings, docs, users)
-│   ├── ingest.py             # POST /api/admin/ingest — trigger ingestion
 │   └── health.py             # GET /api/health/
 └── services/
-    ├── embedder.py            # BGE-M3 embedding service (1024-dim)
+    ├── embedder.py            # Gemini Embedding 2 service (1536-dim)
     ├── llm_client.py          # Google Gemini wrapper + retry logic
+    ├── rate_limiter.py        # Atomic rate limiting
     ├── prompts.py             # System prompts for legal analysis
-    ├── rag_pipeline.py        # Full RAG: embed → search → reconstruct → generate
-    └── reranker.py            # Optional cross-encoder reranker
+    └── rag_pipeline.py        # Full RAG: embed → search → reconstruct → generate
 ```
 
 ---
@@ -77,11 +76,10 @@ app/
 
 ### RAG Pipeline (`services/rag_pipeline.py`)
 
-1. **Embed** user query with BGE-M3
+1. **Embed** user query with Gemini Embedding 2
 2. **Search** pgvector for top-K similar chunks (HNSW cosine)
 3. **Reconstruct** full parent documents from matched chunks
-4. **Rerank** *(optional)* with cross-encoder
-5. **Generate** answer with Gemini using full document context + chat history
+4. **Generate** answer with Gemini using full document context + chat history
 
 ### Ingestion Pipeline (`ingestion/`)
 
@@ -90,14 +88,14 @@ Lex.uz URL → lex_parser.py → Markdown + metadata
                                     ↓
                               chunker.py → semantic chunks
                                     ↓
-                             embedder.py → 1024-dim vectors
+                             embedder.py → 1536-dim vectors
                                     ↓
                             PostgreSQL (documents + chunks tables)
 ```
 
 ### Authentication (`middleware.py` + `routes/auth.py`)
 
-- **JWT** tokens in HTTP-only cookies (`yurika_token`)
+- **JWT** tokens in HTTP-only cookies (`advoai_token`)
 - **bcrypt** password hashing
 - **Google OAuth** via ID token verification
 - **Middleware**: `require_auth` extracts user from cookie, checks ban status
@@ -132,7 +130,6 @@ Each session maintains a `rolling_summary` field. After every exchange, the LLM 
 | `PATCH` | `/api/admin/users/{id}/ban` | Admin | Toggle ban |
 | `PATCH` | `/api/admin/users/{id}/role` | Admin | Change role |
 | `GET` | `/api/admin/users/{id}/stats` | Admin | User analytics |
-| `POST` | `/api/admin/ingest` | Admin | Ingest from URL |
 
 ---
 
@@ -147,10 +144,12 @@ Each session maintains a `rolling_summary` field. After every exchange, the LLM 
 | `JWT_EXPIRY_HOURS` | — | `72` | Token expiry |
 | `GOOGLE_CLIENT_ID` | — | — | For Google OAuth |
 | `GOOGLE_CLIENT_SECRET` | — | — | For Google OAuth |
-| `USE_RERANKER` | — | `False` | Enable cross-encoder reranking |
+| `EMBEDDING_MODEL` | — | `gemini-embedding-2` | Google embedding model |
+| `EMBEDDING_DIMENSIONS` | — | `1536` | Output dimensions |
 | `ENVIRONMENT` | — | `development` | `development` / `production` |
 | `GUEST_MESSAGE_LIMIT` | — | `3` | Overridden by DB `system_settings` |
 | `FREE_DAILY_LIMIT` | — | `20` | Overridden by DB `system_settings` |
+| `CORS_ORIGINS` | — | `http://localhost:3000` | Comma-separated CORS list |
 
 ---
 
@@ -188,6 +187,6 @@ psql "$DATABASE_URL" -f app/database/schema_unified.sql
 ## Docker
 
 ```bash
-docker build -t yurika-backend .
-docker run -p 8000:8000 --env-file .env yurika-backend
+docker build -t advoai-backend .
+docker run -p 8000:8000 --env-file .env advoai-backend
 ```

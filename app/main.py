@@ -2,25 +2,56 @@
 main.py — FastAPI Application Entry Point
 
 Bootstraps the FastAPI application, configures CORS middleware,
-and mounts all route modules.
+manages the database connection pool lifecycle, and mounts all route modules.
 
 Usage:
     uvicorn app.main:app --reload
 """
 
-from fastapi import FastAPI
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.config import settings
 
-# Initialize FastAPI App
+# ── Logging Configuration ─────────────────────────────────────
+
+_log_level = logging.DEBUG if settings.ENVIRONMENT == "development" else logging.INFO
+logging.basicConfig(
+    level=_log_level,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+
+# ── Lifespan: Pool init/teardown ──────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manages startup and shutdown of the database connection pool."""
+    from app.database.connection import init_pool, close_pool
+    logger.info("Starting up AdvoAI API...")
+    init_pool()
+    yield
+    logger.info("Shutting down AdvoAI API...")
+    close_pool()
+
+
+# ── FastAPI App ───────────────────────────────────────────────
+
 app = FastAPI(
-    title="Yurika Legal Chatbot API",
+    title="AdvoAI Legal Chatbot API",
     description="Hybrid Parent-Child RAG backend for Uzbekistan legal system.",
-    version="2.0.0",
+    version="3.0.0",
+    lifespan=lifespan,
 )
 
-# Configure CORS — reads from CORS_ORIGINS env variable (comma-separated)
+# ── CORS ──────────────────────────────────────────────────────
+
 _ALLOWED_ORIGINS = [
     origin.strip()
     for origin in settings.CORS_ORIGINS.split(",")
@@ -35,20 +66,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Root endpoint (required for HF Spaces health check) ──
+# ── Global Exception Handler ──────────────────────────────────
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled exception on {request.method} {request.url}: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An unexpected error occurred. Please try again later."},
+    )
+
+# ── Root Endpoint ─────────────────────────────────────────────
 
 @app.get("/")
 def root():
-    return {"status": "online", "service": "Yurika Legal Chatbot API"}
+    return {"status": "online", "service": "AdvoAI Legal Chatbot API", "version": "3.0.0"}
 
-# ── API Routes (Modular) ──
+# ── API Routes ────────────────────────────────────────────────
 
-from app.routes import health, chat, ingest, auth, sessions, admin
+from app.routes import health, chat, auth, sessions, admin
 
-app.include_router(health.router, prefix="/api/health", tags=["Health"])
-app.include_router(auth.router, prefix="/api/auth", tags=["Auth"])
-app.include_router(chat.router, prefix="/api/chat", tags=["Chat"])
-app.include_router(sessions.router, prefix="/api/sessions", tags=["Sessions"])
-app.include_router(admin.router, prefix="/api/admin", tags=["Admin"])
-app.include_router(ingest.router, prefix="/api/ingest", tags=["Ingestion"])
-
+app.include_router(health.router,    prefix="/api/health",    tags=["Health"])
+app.include_router(auth.router,      prefix="/api/auth",      tags=["Auth"])
+app.include_router(chat.router,      prefix="/api/chat",      tags=["Chat"])
+app.include_router(sessions.router,  prefix="/api/sessions",  tags=["Sessions"])
+app.include_router(admin.router,     prefix="/api/admin",     tags=["Admin"])

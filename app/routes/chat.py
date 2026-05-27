@@ -14,8 +14,8 @@ from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel, Field
 
 from app.services.rag_pipeline import retrieve_context
-from app.services.llm_client import GeminiClient
-from app.middleware import check_rate_limit, get_current_user
+from app.services.llm_client import get_llm_client
+from app.middleware import require_rate_limit, get_current_user
 from app.database.queries import (
     get_session_by_id, update_session_summary,
     create_session, rename_session,
@@ -26,16 +26,16 @@ logger = logging.getLogger(__name__)
 
 
 class ChatRequest(BaseModel):
-    question: str = Field(..., min_length=2, description="The legal question to ask Yurika.")
+    question: str = Field(..., min_length=2, description="The legal question to ask AdvoAI.")
     session_id: Optional[str] = Field(default=None, description="Chat session ID for conversation continuity.")
     top_k: int = Field(default=5, ge=1, le=10, description="Number of vector chunks to retrieve.")
 
 
 @router.post("/")
-async def ask_yurika(
+async def ask_advoai(
     request: ChatRequest,
     http_request: Request,
-    user: Optional[Dict[str, Any]] = Depends(check_rate_limit),
+    user: Optional[Dict[str, Any]] = Depends(require_rate_limit),
 ):
     """
     Core RAG chatbot endpoint with rolling summary memory.
@@ -85,7 +85,7 @@ async def ask_yurika(
 
         # ── 3. Generate answer with Gemini ───────────────────
         try:
-            client = GeminiClient()
+            client = get_llm_client()
             llm_result = client.ask(
                 question=rag_result["question"],
                 context_markdown=rag_result["context_markdown"],

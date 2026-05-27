@@ -32,7 +32,6 @@ class UpdateRoleRequest(BaseModel):
 
 class IngestRequest(BaseModel):
     url: str
-    device: str = "cpu"
 
 
 class UpdateSettingsRequest(BaseModel):
@@ -168,7 +167,7 @@ def trigger_ingest(request: IngestRequest, user=Depends(require_admin)):
     logger.info(f"Admin {user['email']} triggered ingestion for: {request.url}")
 
     try:
-        result = process_and_ingest_law(request.url, device=request.device)
+        result = process_and_ingest_law(request.url)
         return {
             "status": "success",
             "message": "Document ingested successfully.",

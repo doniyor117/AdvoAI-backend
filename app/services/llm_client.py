@@ -108,7 +108,7 @@ class GeminiClient:
 
         Args:
             user_message:     The user's message.
-            ai_response:      Yurika's response.
+            ai_response:      AdvoAI's response.
             previous_summary: The current rolling summary (empty for first message).
 
         Returns:
@@ -160,3 +160,13 @@ class GeminiClient:
         # Truncate to 255 chars just in case
         return title[:255]
 
+from functools import lru_cache
+
+@lru_cache(maxsize=1)
+def get_llm_client() -> GeminiClient:
+    """
+    Returns a cached singleton GeminiClient based on the current system settings.
+    """
+    from app.database.queries import get_setting
+    model_name = get_setting("current_llm_model") or "gemini-2.5-flash"
+    return GeminiClient(model_name=model_name)

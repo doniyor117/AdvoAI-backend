@@ -2,9 +2,12 @@ import requests
 import re
 import tempfile
 import os
+import logging
 from typing import Dict, Any
 from bs4 import BeautifulSoup
 from markitdown import MarkItDown
+
+logger = logging.getLogger(__name__)
 
 class LexParser:
     """
@@ -23,16 +26,16 @@ class LexParser:
         self.md_converter = MarkItDown()
 
     def fetch_html(self, url: str) -> bool:
-        print(f"🌐 Connecting to: {url}")
+        logger.info(f"🌐 Connecting to: {url}")
         self.url = url if "type=doc" in url else f'{url}?type=doc'
         try:
             response = requests.get(self.url, headers=self.headers, timeout=20)
             response.raise_for_status()
             self.soup = BeautifulSoup(response.text, 'lxml')
-            print("✅ Success! HTML loaded.")
+            logger.info("✅ Success! HTML loaded.")
             return True
         except Exception as err:
-            print(f"❌ Error fetching {url}: {err}")
+            logger.error(f"❌ Error fetching {url}: {err}")
             return False
 
     def clean_soup(self):
@@ -73,7 +76,7 @@ class LexParser:
         
         # 3. MarkItDown usually requires a file path. We write our cleaned HTML 
         # to a temporary file, convert it, and delete the temp file.
-        print("📝 Converting cleaned HTML to Markdown...")
+        logger.info("📝 Converting cleaned HTML to Markdown...")
         cleaned_html_string = str(self.soup)
         
         with tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode='w', encoding='utf-8') as temp_file:
@@ -91,13 +94,20 @@ class LexParser:
             "markdown": markdown_content # The full, perfectly formatted document!
         }
     
-if __name__ == '__main__':
-    # Example usage to test the parser file directly. In production, this would be called from the main ingestion pipeline.:
-    url = input("Enter a Lex.uz document URL: ")
+if __name__ == "__main__":
+    import json
+    
+    # Configure basic logging for direct script execution
+    logging.basicConfig(level=logging.INFO)
+    
     parser = LexParser()
-    if parser.fetch_html(url):
+    test_url = "https://lex.uz/docs/7339833"
+    
+    if parser.fetch_html(test_url):
         result = parser.parse()
-        print("Metadata:", result["metadata"], end="\n\n")
-        show_markdown = input("Show full markdown text? (y/n): ")
-        if show_markdown.lower() == 'y':
-            print(result["markdown"])
+        logger.info(f"Metadata:\n{json.dumps(result['metadata'], indent=2, ensure_ascii=False)}")
+        
+        # Optionally write markdown to file to view it
+        with open("test_output.md", "w", encoding="utf-8") as f:
+            f.write(result["markdown"])
+        logger.info("Output written to test_output.md")

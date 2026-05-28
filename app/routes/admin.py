@@ -49,7 +49,7 @@ class UpdateDocTitleRequest(BaseModel):
 @router.get("/stats")
 async def dashboard_stats(user=Depends(require_admin)):
     """Returns aggregated statistics for the admin dashboard."""
-    stats = get_admin_stats()
+    stats = await get_admin_stats()
     return {"stats": stats}
 
 
@@ -58,7 +58,7 @@ async def dashboard_stats(user=Depends(require_admin)):
 @router.get("/settings")
 async def get_settings(user=Depends(require_admin)):
     """Returns all system settings."""
-    settings = get_all_settings()
+    settings = await get_all_settings()
     return {"settings": settings}
 
 
@@ -67,16 +67,16 @@ async def update_settings(request: UpdateSettingsRequest, user=Depends(require_a
     """Updates system settings (partial update)."""
     updated = []
     if request.current_llm_model is not None:
-        update_setting("current_llm_model", request.current_llm_model)
+        await update_setting("current_llm_model", request.current_llm_model)
         updated.append("current_llm_model")
     if request.guest_message_limit is not None:
-        update_setting("guest_message_limit", str(request.guest_message_limit))
+        await update_setting("guest_message_limit", str(request.guest_message_limit))
         updated.append("guest_message_limit")
     if request.free_daily_limit is not None:
-        update_setting("free_daily_limit", str(request.free_daily_limit))
+        await update_setting("free_daily_limit", str(request.free_daily_limit))
         updated.append("free_daily_limit")
 
-    return {"message": f"Updated: {', '.join(updated)}", "settings": get_all_settings()}
+    return {"message": f"Updated: {', '.join(updated)}", "settings": await get_all_settings()}
 
 
 # ── Users ────────────────────────────────────────────────────
@@ -84,7 +84,7 @@ async def update_settings(request: UpdateSettingsRequest, user=Depends(require_a
 @router.get("/users")
 async def list_users(user=Depends(require_admin)):
     """Lists all users with their usage data."""
-    users = get_all_users()
+    users = await get_all_users()
     return {"users": users}
 
 
@@ -105,7 +105,7 @@ async def change_user_role(user_id: str, request: UpdateRoleRequest, user=Depend
 @router.patch("/users/{user_id}/ban")
 async def ban_user(user_id: str, user=Depends(require_admin)):
     """Toggles the ban status of a user."""
-    new_status = toggle_ban_user(user_id)
+    new_status = await toggle_ban_user(user_id)
     action = "banned" if new_status else "unbanned"
     return {"message": f"User {action}.", "is_banned": new_status}
 
@@ -122,14 +122,14 @@ async def user_stats(user_id: str, user=Depends(require_admin)):
 @router.get("/documents")
 async def list_documents(user=Depends(require_admin)):
     """Lists all ingested documents with metadata."""
-    documents = get_all_documents_admin()
+    documents = await get_all_documents_admin()
     return {"documents": documents}
 
 
 @router.get("/documents/{doc_id}")
 async def view_document(doc_id: str, user=Depends(require_admin)):
     """Gets a single document with its full markdown content."""
-    doc = get_document_full(doc_id)
+    doc = await get_document_full(doc_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found.")
     return {"document": doc}
@@ -138,17 +138,17 @@ async def view_document(doc_id: str, user=Depends(require_admin)):
 @router.patch("/documents/{doc_id}")
 async def edit_document(doc_id: str, request: UpdateDocTitleRequest, user=Depends(require_admin)):
     """Updates a document's title."""
-    doc = get_document_full(doc_id)
+    doc = await get_document_full(doc_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found.")
-    update_document_title(doc_id, request.title)
+    await update_document_title(doc_id, request.title)
     return {"message": "Document title updated.", "title": request.title}
 
 
 @router.delete("/documents/{doc_id}")
 async def remove_document(doc_id: str, user=Depends(require_admin)):
     """Deletes a document and all its associated chunks (CASCADE)."""
-    doc = get_document_full(doc_id)
+    doc = await get_document_full(doc_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found.")
     await delete_document(doc_id)

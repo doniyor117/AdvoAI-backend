@@ -12,8 +12,9 @@ The core chat pipeline has been successfully upgraded to an "Agentic RAG" patter
 - **Strict Guardrails (`prompts.py`)**: General knowledge questions and basic definitions (e.g., "What is a constitution?") are strictly flagged as `conversational` to prevent wasteful vector database searches. Tool calling is strictly forbidden via prompting, forcing the model to rely solely on structured JSON outputs.
 
 ### High-Performance Asynchronous Offloading
-Heavy LLM operations have been successfully decoupled from the HTTP response cycle.
+Heavy LLM operations and blocking I/O have been successfully decoupled from the HTTP response cycle.
 - **Background Tasks (`chat.py`)**: Both chat session title generation and the sliding-window archive summarization are pushed to `FastAPI BackgroundTasks`. This allows the API to return answers instantly, improving the UX significantly.
+- **Thread Offloading (`main_ingest.py`)**: Synchronous network calls (e.g. `requests.get` via `LexParser`) and CPU-intensive parsing (`BeautifulSoup`, `MarkItDown`) are wrapped in `asyncio.to_thread()` so they do not block the Uvicorn event loop during document ingestion.
 
 ### Robust LLM Communication
 - **Exponential Backoff (`llm_client.py: _generate_with_retry`)**: A custom retry loop using exponential backoff (1s, 2s, 4s) ensures that the system gracefully recovers from intermittent network failures or LLM API rate limits.

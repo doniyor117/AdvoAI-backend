@@ -1,5 +1,8 @@
 import uuid
+import logging
 from typing import List, Dict, Any
+
+logger = logging.getLogger(__name__)
 
 class LegalUnstructuredChunker:
     """
@@ -17,7 +20,7 @@ class LegalUnstructuredChunker:
         so we can find the Mega-chunk Parent Document later via FK lookup.
         """
         if not markdown_string or not markdown_string.strip():
-            print("⚠️  Warning: Cannot chunk empty markdown string.")
+            logger.warning("Cannot chunk empty markdown string.")
             return []
 
         # Split by double newline first (paragraphs / block elements)
@@ -73,9 +76,9 @@ class LegalUnstructuredChunker:
         # Log chunk statistics
         if final_chunks:
             lengths = [len(c["text"]) for c in final_chunks]
-            print(f"✅ Generated {len(final_chunks)} search chunks for part.")
-            print(f"   📊 Text lengths — avg: {sum(lengths)//len(lengths)} | min: {min(lengths)} | max: {max(lengths)} chars")
+            logger.info(f"Generated {len(final_chunks)} search chunks for part.")
+            logger.info(f"Text lengths — avg: {sum(lengths)//len(lengths)} | min: {min(lengths)} | max: {max(lengths)} chars")
         else:
-            print("⚠️  No chunks generated.")
+            logger.warning("No chunks generated.")
 
         return final_chunks

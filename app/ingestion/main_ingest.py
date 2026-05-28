@@ -9,6 +9,7 @@ import logging
 import re
 import uuid
 import argparse
+import asyncio
 from typing import Dict, List, Any, Optional
 
 from app.ingestion.lex_parser import LexParser
@@ -104,13 +105,15 @@ async def process_and_ingest_law(url: str, skip_db: bool = False) -> Optional[Di
             logger.info(f"Document '{source_doc_id}' already exists in DB. Skipping.")
             return None
 
-    # Step 2: Fetch HTML and parse to Markdown
+    # Step 2: Fetch HTML and parse to Markdown (CPU/Network heavy -> thread offload)
     parser = LexParser()
-    if not parser.fetch_html(url):
+    
+    fetch_success = await asyncio.to_thread(parser.fetch_html, url)
+    if not fetch_success:
         logger.error("Pipeline aborted: could not fetch HTML.")
         return None
 
-    result = parser.parse()
+    result = await asyncio.to_thread(parser.parse)
     base_metadata: Dict[str, Any] = result["metadata"]
     markdown: str = result["markdown"]
 

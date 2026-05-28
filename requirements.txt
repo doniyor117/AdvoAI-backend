@@ -7,11 +7,12 @@ asyncpg
 pgvector
 python-dotenv
 
-# ── Web Scraping & Parsing ───────────────────────────────────
+# ── Web Scraping & Parsing & Email ───────────────────────────
 beautifulsoup4
 lxml
 requests
 markitdown[all]
+resend
 
 # ── Document Chunking ────────────────────────────────────────
 unstructured

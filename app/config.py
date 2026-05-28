@@ -36,11 +36,8 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRY_HOURS: int = 72
 
-    # ── Email / SMTP (Optional fallback to console) ──────────────
-    SMTP_HOST: str | None = None
-    SMTP_PORT: int = 587
-    SMTP_USER: str | None = None
-    SMTP_PASSWORD: str | None = None
+    # ── Email / Resend (Optional fallback to console) ────────────
+    RESEND_API_KEY: str | None = None
     EMAILS_FROM_EMAIL: str = "noreply@advoai.uz"
     EMAILS_FROM_NAME: str = "AdvoAI Security"
 

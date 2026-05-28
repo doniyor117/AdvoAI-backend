@@ -1,7 +1,5 @@
-import smtplib
 import logging
 import secrets
-from email.message import EmailMessage
 from datetime import datetime, timezone, timedelta
 
 from app.config import settings
@@ -16,28 +14,31 @@ def get_otp_expiry(minutes: int = 15) -> datetime:
     """Returns the expiration timestamp for an OTP."""
     return datetime.now(timezone.utc) + timedelta(minutes=minutes)
 
+import resend
+
 async def send_email(to_email: str, subject: str, body: str) -> bool:
     """
-    Sends an email using SMTP if configured, otherwise prints to console.
+    Sends an email using Resend if configured, otherwise prints to console.
     """
-    if not (settings.SMTP_HOST and settings.SMTP_USER and settings.SMTP_PASSWORD):
+    if not settings.RESEND_API_KEY:
         # Fallback to console for development
         logger.warning(f"\n{'='*50}\n📧 MOCK EMAIL TO: {to_email}\nSUBJECT: {subject}\n\n{body}\n{'='*50}\n")
         return True
 
-    msg = EmailMessage()
-    msg.set_content(body)
-    msg["Subject"] = subject
-    msg["From"] = f"{settings.EMAILS_FROM_NAME} <{settings.EMAILS_FROM_EMAIL}>"
-    msg["To"] = to_email
+    resend.api_key = settings.RESEND_API_KEY
 
     try:
-        with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT) as server:
-            server.starttls()
-            server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
-            server.send_message(msg)
-            logger.info(f"Email sent successfully to {to_email}")
-            return True
+        params = {
+            "from": f"{settings.EMAILS_FROM_NAME} <{settings.EMAILS_FROM_EMAIL}>",
+            "to": [to_email],
+            "subject": subject,
+            "text": body,
+        }
+        
+        import asyncio
+        response = await asyncio.to_thread(resend.Emails.send, params)
+        logger.info(f"Email sent successfully via Resend to {to_email}")
+        return True
     except Exception as e:
         logger.error(f"Failed to send email to {to_email}: {e}")
         return False

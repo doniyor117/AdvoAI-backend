@@ -272,7 +272,7 @@ async def get_user_by_google_id(google_id: str) -> Optional[Dict[str, Any]]:
 
 # ── Verification Codes & Account Updates ───────────────────────
 
-async def create_verification_code(email: str, code: str, code_type: str, expires_at: str, user_id: Optional[str] = None) -> None:
+async def create_verification_code(email: str, code: str, code_type: str, expires_at: datetime, user_id: Optional[str] = None) -> None:
     """Inserts a new verification code, overwriting any previous one for the same email and type."""
     async with get_connection() as cur:
         # First delete any existing codes for this email and type

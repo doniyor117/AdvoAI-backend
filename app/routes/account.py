@@ -75,7 +75,7 @@ async def request_password_reset(request: RequestResetPasswordRequest):
         return {"message": "If the email exists, a password reset code has been sent."}
 
     otp = generate_otp()
-    expires_at = get_otp_expiry(minutes=15).isoformat()
+    expires_at = get_otp_expiry(minutes=15)
     await create_verification_code(request.email, otp, "password_reset", expires_at, user_id=db_user["id"])
     await send_password_reset_otp(request.email, otp)
     
@@ -109,7 +109,7 @@ async def request_email_change(request: RequestEmailChangeRequest, user=Depends(
         raise HTTPException(status_code=409, detail="This email is already in use by another account.")
 
     otp = generate_otp()
-    expires_at = get_otp_expiry(minutes=15).isoformat()
+    expires_at = get_otp_expiry(minutes=15)
     
     # Store verification code under the NEW email
     await create_verification_code(request.new_email, otp, "email_change", expires_at, user_id=user["id"])

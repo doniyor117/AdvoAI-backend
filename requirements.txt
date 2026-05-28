@@ -25,6 +25,7 @@ google-genai
 fastapi
 uvicorn
 pydantic-settings
+python-multipart
 
 # ── Auth ─────────────────────────────────────────────────────
 bcrypt

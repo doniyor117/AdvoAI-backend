@@ -113,7 +113,7 @@ async def send_registration_otp_route(request: SendOTPRequest):
         raise HTTPException(status_code=409, detail="An account with this email already exists.")
 
     otp = generate_otp()
-    expires_at = get_otp_expiry(minutes=15).isoformat()
+    expires_at = get_otp_expiry(minutes=15)
     
     await create_verification_code(request.email, otp, "registration", expires_at)
     success = await send_registration_otp(request.email, otp)

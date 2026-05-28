@@ -15,9 +15,11 @@ import bcrypt
 
 from app.config import settings
 from app.middleware import create_access_token, get_current_user
+from app.services.email import generate_otp, get_otp_expiry, send_registration_otp
 from app.database.queries import (
     create_user, get_user_by_email, get_user_by_google_id,
-    update_last_login, get_user_by_id
+    update_last_login, get_user_by_id,
+    create_verification_code, get_verification_code, delete_verification_codes_by_email
 )
 
 router = APIRouter()
@@ -26,10 +28,15 @@ logger = logging.getLogger(__name__)
 
 # ── Request/Response Models ──────────────────────────────────
 
+class SendOTPRequest(BaseModel):
+    email: EmailStr
+
+
 class RegisterRequest(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=8, description="Minimum 8 characters")
     full_name: str = Field(..., min_length=2)
+    otp: str = Field(..., min_length=6, max_length=6, description="6-digit verification code")
 
 
 class LoginRequest(BaseModel):
@@ -64,13 +71,17 @@ def _set_auth_cookie(response: Response, user_id: str, role: str) -> str:
     """Creates JWT and sets it as an HTTP-only cookie."""
     token = create_access_token({"sub": user_id, "role": role})
     is_production = settings.ENVIRONMENT != "development"
+    max_age_seconds = settings.JWT_EXPIRY_HOURS * 3600
+    expires_datetime = datetime.now(timezone.utc) + timedelta(seconds=max_age_seconds)
+    
     response.set_cookie(
         key="advoai_token",
         value=token,
         httponly=True,
         secure=is_production,
         samesite="none" if is_production else "lax",
-        max_age=settings.JWT_EXPIRY_HOURS * 3600,
+        max_age=max_age_seconds,
+        expires=expires_datetime.strftime("%a, %d %b %Y %H:%M:%S GMT"),
         path="/",
     )
     return token
@@ -84,20 +95,49 @@ def _user_to_response(user: dict) -> dict:
         "role": user["role"],
         "auth_provider": user["auth_provider"],
         "email_verified": user.get("email_verified", False),
+        "has_password": bool(user.get("password_hash")),
+        "is_google_linked": bool(user.get("google_id")),
     }
 
 
 # ── Routes ───────────────────────────────────────────────────
 
-@router.post("/register")
-async def register(request: RegisterRequest, response: Response):
+@router.post("/send-registration-otp")
+async def send_registration_otp_route(request: SendOTPRequest):
     """
-    Register a new user with email and password.
+    Generates a 6-digit OTP and sends it to the user's email for registration.
     """
     # Check if email already exists
     existing = await get_user_by_email(request.email)
     if existing:
         raise HTTPException(status_code=409, detail="An account with this email already exists.")
+
+    otp = generate_otp()
+    expires_at = get_otp_expiry(minutes=15).isoformat()
+    
+    await create_verification_code(request.email, otp, "registration", expires_at)
+    success = await send_registration_otp(request.email, otp)
+    
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to send verification email.")
+        
+    return {"message": "Verification code sent to email."}
+
+
+@router.post("/register")
+async def register(request: RegisterRequest, response: Response):
+    """
+    Register a new user with email, password, and OTP verification.
+    """
+    # Check if email already exists
+    existing = await get_user_by_email(request.email)
+    if existing:
+        raise HTTPException(status_code=409, detail="An account with this email already exists.")
+
+    # Verify OTP
+    code_record = await get_verification_code(request.email, request.otp, "registration")
+    if not code_record:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code.")
 
     # Create user
     password_hash = _hash_password(request.password)
@@ -110,6 +150,9 @@ async def register(request: RegisterRequest, response: Response):
 
     if not user:
         raise HTTPException(status_code=500, detail="Failed to create account. Please try again.")
+
+    # Cleanup OTP
+    await delete_verification_codes_by_email(request.email, "registration")
 
     # Set auth cookie + return token in body
     token = _set_auth_cookie(response, str(user["id"]), user.get("role", "guest"))

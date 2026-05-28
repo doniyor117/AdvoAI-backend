@@ -84,10 +84,11 @@ def root():
 
 # ── API Routes ────────────────────────────────────────────────
 
-from app.routes import health, chat, auth, sessions, admin
+from app.routes import health, chat, auth, sessions, admin, account
 
 app.include_router(health.router,    prefix="/api/health",    tags=["Health"])
 app.include_router(auth.router,      prefix="/api/auth",      tags=["Auth"])
+app.include_router(account.router,   prefix="/api/account",   tags=["Account"])
 app.include_router(chat.router,      prefix="/api/chat",      tags=["Chat"])
 app.include_router(sessions.router,  prefix="/api/sessions",  tags=["Sessions"])
 app.include_router(admin.router,     prefix="/api/admin",     tags=["Admin"])

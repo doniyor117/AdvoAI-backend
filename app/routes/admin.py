@@ -39,6 +39,10 @@ class UpdateSettingsRequest(BaseModel):
     current_router_model: Optional[str] = None
     guest_message_limit: Optional[int] = None
     free_daily_limit: Optional[int] = None
+    free_daily_doc_limit: Optional[int] = None
+    free_daily_image_limit: Optional[int] = None
+    guest_doc_limit: Optional[int] = None
+    guest_image_limit: Optional[int] = None
 
 
 class UpdateDocTitleRequest(BaseModel):
@@ -79,6 +83,18 @@ async def update_settings(request: UpdateSettingsRequest, user=Depends(require_a
     if request.free_daily_limit is not None:
         await update_setting("free_daily_limit", str(request.free_daily_limit))
         updated.append("free_daily_limit")
+    if request.free_daily_doc_limit is not None:
+        await update_setting("free_daily_doc_limit", str(request.free_daily_doc_limit))
+        updated.append("free_daily_doc_limit")
+    if request.free_daily_image_limit is not None:
+        await update_setting("free_daily_image_limit", str(request.free_daily_image_limit))
+        updated.append("free_daily_image_limit")
+    if request.guest_doc_limit is not None:
+        await update_setting("guest_doc_limit", str(request.guest_doc_limit))
+        updated.append("guest_doc_limit")
+    if request.guest_image_limit is not None:
+        await update_setting("guest_image_limit", str(request.guest_image_limit))
+        updated.append("guest_image_limit")
 
     return {"message": f"Updated: {', '.join(updated)}", "settings": await get_all_settings()}
 

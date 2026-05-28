@@ -14,8 +14,8 @@ from typing import Dict, Any
 
 from google import genai
 from google.genai import types
-
 from app.config import settings
+from app.services.api_keys import api_key_manager
 from app.services.prompts import (
     SYSTEM_PROMPT,
     RAG_USER_PROMPT_TEMPLATE,
@@ -34,35 +34,49 @@ logger = logging.getLogger(__name__)
 class GeminiClient:
     """
     Wraps Google's GenAI API for legal QA, routing, and summarization.
+    Uses ApiKeyManager to handle rate limits with multiple keys.
     """
 
     def __init__(self, main_model: str = "gemini-3.1-flash-lite", router_model: str = "gemma-4-31b-it"):
-        if not settings.GOOGLE_API_KEY:
-            raise ValueError("❌ GOOGLE_API_KEY not set. Add it to your .env file.")
-
-        self.client = genai.Client(api_key=settings.GOOGLE_API_KEY)
         self.main_model = main_model
         self.router_model = router_model
 
         logger.info(f"🤖 Main LLM initialized: {self.main_model}")
         logger.info(f"🧠 Router LLM initialized: {self.router_model}")
 
-    async def _generate_with_retry(self, model: str, contents: Any, config: Any, max_retries: int = 3):
-        """Helper to execute generate_content with exponential backoff retries."""
+    @property
+    def client(self):
+        """Returns the dynamically active genai.Client from the ApiKeyManager."""
+        return api_key_manager.get_current_client()
+
+    async def _generate_with_retry(self, model: str, contents: Any, config: Any, max_retries: int = 5):
+        """Helper to execute generate_content with exponential backoff retries and key rotation."""
+        keys_tried = 1
         for attempt in range(max_retries):
             try:
-                return await self.client.aio.models.generate_content(
+                client = api_key_manager.get_current_client()
+                return await client.aio.models.generate_content(
                     model=model,
                     contents=contents,
                     config=config,
                 )
             except Exception as e:
+                err_str = str(e)
                 if attempt == max_retries - 1:
                     logger.error(f"❌ LLM API failed after {max_retries} attempts: {e}")
                     raise
+                    
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    if len(api_key_manager.keys) > 1 and keys_tried < len(api_key_manager.keys):
+                        api_key_manager.rotate_key()
+                        keys_tried += 1
+                        logger.info(f"Retrying generation immediately with new API key...")
+                        continue # retry immediately without sleeping
+                
                 wait_time = 2 ** attempt
                 logger.warning(f"⚠️ LLM API error: {e}. Retrying in {wait_time}s... (Attempt {attempt+1}/{max_retries})")
                 await asyncio.sleep(wait_time)
+                keys_tried = 1 # Reset after sleeping
 
     async def route_query(self, question: str, recent_messages: list = None) -> Dict[str, str]:
         """

@@ -81,6 +81,17 @@ CREATE TABLE IF NOT EXISTS public.users (
     last_login_at   timestamptz
 );
 
+-- OTP / Verification Codes table
+CREATE TABLE IF NOT EXISTS public.verification_codes (
+    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         uuid REFERENCES public.users(id) ON DELETE CASCADE, -- NULL if pre-registration
+    email           varchar(255) NOT NULL,
+    code            varchar(10) NOT NULL,
+    type            varchar(20) NOT NULL CHECK (type IN ('registration', 'password_reset', 'email_change')),
+    expires_at      timestamptz NOT NULL,
+    created_at      timestamptz DEFAULT NOW()
+);
+
 -- Chat sessions table (contains Archive Summary)
 CREATE TABLE IF NOT EXISTS public.chat_sessions (
     id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -107,6 +118,8 @@ CREATE TABLE IF NOT EXISTS public.usage_logs (
     user_id         uuid NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
     usage_date      date NOT NULL DEFAULT CURRENT_DATE,
     message_count   integer NOT NULL DEFAULT 0,
+    doc_upload_count integer NOT NULL DEFAULT 0,
+    image_upload_count integer NOT NULL DEFAULT 0,
     UNIQUE (user_id, usage_date)
 );
 
@@ -115,6 +128,8 @@ CREATE TABLE IF NOT EXISTS public.guest_usage (
     id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     fingerprint     varchar(64) NOT NULL UNIQUE,
     message_count   integer NOT NULL DEFAULT 0,
+    doc_upload_count integer NOT NULL DEFAULT 0,
+    image_upload_count integer NOT NULL DEFAULT 0,
     first_seen_at   timestamptz DEFAULT NOW(),
     last_seen_at    timestamptz DEFAULT NOW()
 );
@@ -138,7 +153,11 @@ CREATE TABLE IF NOT EXISTS public.system_settings (
 INSERT INTO system_settings (key, value) VALUES
     ('current_llm_model', 'gemini-3.1-flash-lite'),
     ('guest_message_limit', '3'),
-    ('free_daily_limit', '20')
+    ('free_daily_limit', '20'),
+    ('free_daily_doc_limit', '10'),
+    ('free_daily_image_limit', '10'),
+    ('guest_doc_limit', '2'),
+    ('guest_image_limit', '2')
 ON CONFLICT (key) DO NOTHING;
 
 -- Safely add is_banned column to users (idempotent)

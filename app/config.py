@@ -24,7 +24,8 @@ class Settings(BaseSettings):
     DATABASE_URL: str  # Required — no default
 
     # ── Google AI ─────────────────────────────────────────────
-    GOOGLE_API_KEY: str  # Required — no default
+    GOOGLE_API_KEY: str = ""  # Can be empty if GOOGLE_API_KEYS is used
+    GOOGLE_API_KEYS: str = "" # Comma separated list of keys
 
     # ── Embedding Model ───────────────────────────────────────
     EMBEDDING_MODEL: str = "gemini-embedding-2"
@@ -35,9 +36,23 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRY_HOURS: int = 72
 
+    # ── Email / SMTP (Optional fallback to console) ──────────────
+    SMTP_HOST: str | None = None
+    SMTP_PORT: int = 587
+    SMTP_USER: str | None = None
+    SMTP_PASSWORD: str | None = None
+    EMAILS_FROM_EMAIL: str = "noreply@advoai.uz"
+    EMAILS_FROM_NAME: str = "AdvoAI Security"
+
     # ── Google OAuth ──────────────────────────────────────────
     GOOGLE_CLIENT_ID: str = ""
     GOOGLE_CLIENT_SECRET: str = ""
+
+    # ── S3 / Cloudflare R2 Storage ────────────────────────────
+    S3_ENDPOINT_URL: str | None = None
+    S3_ACCESS_KEY_ID: str | None = None
+    S3_SECRET_ACCESS_KEY: str | None = None
+    S3_BUCKET_NAME: str | None = None
 
     # ── Usage Limits ──────────────────────────────────────────
     GUEST_MESSAGE_LIMIT: int = 3
@@ -60,7 +75,21 @@ class Settings(BaseSettings):
                 "JWT_SECRET_KEY must not be a placeholder. "
                 "Generate a real secret with: python -c \"import secrets; print(secrets.token_hex(32))\""
             )
+            
+        if not self.GOOGLE_API_KEY and not self.GOOGLE_API_KEYS:
+            raise ValueError("Either GOOGLE_API_KEY or GOOGLE_API_KEYS must be set.")
+            
         return self
+
+    def get_google_api_keys(self) -> list[str]:
+        """Returns a list of Google API keys by parsing GOOGLE_API_KEYS or GOOGLE_API_KEY."""
+        keys_str = self.GOOGLE_API_KEYS or self.GOOGLE_API_KEY
+        keys = [k.strip() for k in keys_str.split(",") if k.strip()]
+        
+        if not keys:
+            raise ValueError("No valid Google API keys found in configuration.")
+            
+        return keys
 
 
 # Singleton settings object imported throughout the application

@@ -258,6 +258,7 @@ async def get_user_by_id(user_id: str) -> Optional[Dict[str, Any]]:
 
 
 async def get_user_by_google_id(google_id: str) -> Optional[Dict[str, Any]]:
+    """Retrieves a user by their Google ID."""
     sql = """
         SELECT id, email, password_hash, full_name, role, auth_provider,
                google_id, email_verified, is_active, is_banned, created_at, last_login_at
@@ -267,6 +268,70 @@ async def get_user_by_google_id(google_id: str) -> Optional[Dict[str, Any]]:
         await cur.execute(sql, (google_id,))
         row = cur.fetchone()
     return _user_row(row) if row else None
+
+
+# ── Verification Codes & Account Updates ───────────────────────
+
+async def create_verification_code(email: str, code: str, code_type: str, expires_at: str, user_id: Optional[str] = None) -> None:
+    """Inserts a new verification code, overwriting any previous one for the same email and type."""
+    async with get_connection() as cur:
+        # First delete any existing codes for this email and type
+        await cur.execute(
+            "DELETE FROM verification_codes WHERE email = %s AND type = %s;",
+            (email, code_type)
+        )
+        sql = """
+            INSERT INTO verification_codes (user_id, email, code, type, expires_at)
+            VALUES (%s, %s, %s, %s, %s);
+        """
+        params = (user_id if user_id else None, email, code, code_type, expires_at)
+        if user_id:
+            sql = """
+                INSERT INTO verification_codes (user_id, email, code, type, expires_at)
+                VALUES (%s::uuid, %s, %s, %s, %s);
+            """
+        await cur.execute(sql, params)
+
+
+async def get_verification_code(email: str, code: str, code_type: str) -> Optional[Dict[str, Any]]:
+    """Returns the verification code if it exists and is not expired."""
+    async with get_connection() as cur:
+        sql = """
+            SELECT * FROM verification_codes 
+            WHERE email = %s AND code = %s AND type = %s AND expires_at > NOW();
+        """
+        await cur.execute(sql, (email, code, code_type))
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+async def delete_verification_codes_by_email(email: str, code_type: str) -> None:
+    async with get_connection() as cur:
+        await cur.execute("DELETE FROM verification_codes WHERE email = %s AND type = %s;", (email, code_type))
+
+
+async def update_user_password(user_id: str, new_password_hash: str) -> None:
+    async with get_connection() as cur:
+        await cur.execute(
+            "UPDATE users SET password_hash = %s WHERE id = %s::uuid;",
+            (new_password_hash, user_id)
+        )
+
+
+async def update_user_email(user_id: str, new_email: str) -> None:
+    async with get_connection() as cur:
+        await cur.execute(
+            "UPDATE users SET email = %s, email_verified = TRUE WHERE id = %s::uuid;",
+            (new_email, user_id)
+        )
+
+
+async def unlink_google_id(user_id: str) -> None:
+    async with get_connection() as cur:
+        await cur.execute(
+            "UPDATE users SET google_id = NULL WHERE id = %s::uuid;",
+            (user_id,)
+        )
 
 
 async def link_google_id(user_id: str, google_id: str) -> None:
@@ -468,6 +533,37 @@ async def increment_guest_usage(fingerprint: str) -> int:
         await cur.execute(sql, (fingerprint,))
         row = cur.fetchone()
     return row["message_count"] if row else 1
+
+
+async def increment_upload_usage(user_id: str, upload_type: str) -> int:
+    column = "image_upload_count" if upload_type == "image" else "doc_upload_count"
+    sql = f"""
+        INSERT INTO usage_logs (user_id, usage_date, {column})
+        VALUES (%s::uuid, CURRENT_DATE, 1)
+        ON CONFLICT (user_id, usage_date)
+        DO UPDATE SET {column} = usage_logs.{column} + 1
+        RETURNING {column};
+    """
+    async with get_connection() as cur:
+        await cur.execute(sql, (user_id,))
+        row = cur.fetchone()
+    return row[column] if row else 1
+
+
+async def increment_guest_upload_usage(fingerprint: str, upload_type: str) -> int:
+    column = "image_upload_count" if upload_type == "image" else "doc_upload_count"
+    sql = f"""
+        INSERT INTO guest_usage (fingerprint, {column})
+        VALUES (%s, 1)
+        ON CONFLICT (fingerprint)
+        DO UPDATE SET {column} = guest_usage.{column} + 1,
+                      last_seen_at = NOW()
+        RETURNING {column};
+    """
+    async with get_connection() as cur:
+        await cur.execute(sql, (fingerprint,))
+        row = cur.fetchone()
+    return row[column] if row else 1
 
 
 # ── Admin Queries ─────────────────────────────────────────────

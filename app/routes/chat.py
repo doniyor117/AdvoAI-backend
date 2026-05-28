@@ -22,6 +22,8 @@ from app.services.converter import (
     convert_to_markdown,
     save_markdown_as_tempfile,
 )
+from app.services.rate_limiter import check_upload_limit
+from app.services.storage import upload_file_to_s3, download_file_from_s3
 from app.middleware import require_rate_limit, get_current_user
 from app.database.queries import (
     get_session_by_id, update_session_summary,
@@ -96,6 +98,7 @@ class FileAttachment(BaseModel):
     mime_type: str = Field(..., description="MIME type of the file")
     name: str = Field(..., description="Internal Google name for the file")
     display_name: str = Field(..., description="Original filename")
+    s3_key: Optional[str] = Field(default=None, description="S3/R2 storage key for persistent access")
 
 class ChatRequest(BaseModel):
     question: str = Field(default="", description="The legal question to ask AdvoAI.")
@@ -151,8 +154,9 @@ async def _background_history_maintenance(
 
 @router.post("/upload")
 async def upload_file(
+    request: Request,
     file: UploadFile = File(...),
-    user: dict = Depends(require_rate_limit)
+    user: Optional[dict] = Depends(get_current_user)
 ):
     """
     Uploads a file to Google GenAI for multimodal analysis.
@@ -183,6 +187,10 @@ async def upload_file(
                 status_code=415,
                 detail=_get_rejection_hint(base_mime)
             )
+
+        is_image = base_mime.startswith("image/")
+        upload_type = "image" if is_image else "doc"
+        await check_upload_limit(request, user, upload_type)
 
         # ── 2. Read and validate size ────────────────────────
         content = await file.read()
@@ -242,11 +250,15 @@ async def upload_file(
 
         logger.info(f"File ready: {uploaded_file.name} | state={getattr(uploaded_file, 'state', 'unknown')}")
 
+        # ── 7. Upload to S3/R2 (Parallel or Sequential) ───────
+        s3_key = await upload_file_to_s3(upload_path, upload_display_name, upload_mime)
+
         return {
             "uri": uploaded_file.uri,
             "mime_type": uploaded_file.mime_type or upload_mime,
             "name": uploaded_file.name,
             "display_name": display_name,  # Always show the original filename to the user
+            "s3_key": s3_key,
         }
 
     except HTTPException:
@@ -366,7 +378,51 @@ async def ask_advoai(
                         "intent": intent,
                     }
 
-        # ── 4. Generate answer with Main LLM ────────────────
+        # ── 4. Verify & Re-upload Expired Attachments ───────
+        if request.attachments:
+            for att in request.attachments:
+                try:
+                    await client.client.aio.files.get(name=att.name)
+                except Exception as e:
+                    logger.warning(f"Gemini file {att.name} expired or not found. Attempting S3 re-upload. Error: {e}")
+                    if att.s3_key:
+                        tmp_path = await download_file_from_s3(att.s3_key)
+                        if tmp_path:
+                            # Re-upload to Gemini
+                            try:
+                                uploaded_file = await client.client.aio.files.upload(
+                                    file=tmp_path,
+                                    config={
+                                        "display_name": att.display_name,
+                                        "mime_type": att.mime_type,
+                                    }
+                                )
+                                # Wait for ACTIVE state
+                                import asyncio
+                                max_wait_seconds = 30
+                                waited = 0
+                                while getattr(uploaded_file, "state", None) and \
+                                      str(uploaded_file.state).upper() not in ("ACTIVE", "FILE_STATE_ACTIVE", "2"):
+                                    if waited >= max_wait_seconds:
+                                        break
+                                    await asyncio.sleep(2)
+                                    waited += 2
+                                    uploaded_file = await client.client.aio.files.get(name=uploaded_file.name)
+                                
+                                # Update attachment references
+                                att.uri = uploaded_file.uri
+                                att.name = uploaded_file.name
+                                logger.info(f"Successfully re-uploaded {att.s3_key} to Gemini: {att.name}")
+                            except Exception as up_err:
+                                logger.error(f"Failed to re-upload to Gemini: {up_err}")
+                            finally:
+                                import os
+                                try:
+                                    os.remove(tmp_path)
+                                except Exception:
+                                    pass
+
+        # ── 5. Generate answer with Main LLM ────────────────
         try:
             llm_result = await client.ask(
                 question=request.question,

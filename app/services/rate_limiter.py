@@ -11,7 +11,10 @@ from typing import Optional, Dict, Any
 from fastapi import Request, HTTPException, Depends
 
 from app.config import settings
-from app.database.queries import increment_usage, increment_guest_usage, get_setting
+from app.database.queries import (
+    increment_usage, increment_guest_usage, get_setting,
+    increment_upload_usage, increment_guest_upload_usage
+)
 
 logger = logging.getLogger(__name__)
 
@@ -100,3 +103,47 @@ async def check_rate_limit(
         )
 
     return None
+
+async def check_upload_limit(
+    request: Request,
+    user: Optional[Dict[str, Any]],
+    upload_type: str
+) -> None:
+    """
+    Checks and increments upload limits. upload_type is 'doc' or 'image'.
+    """
+    if user:
+        if user.get("is_banned"):
+            raise HTTPException(status_code=403, detail="Your account has been suspended.")
+        
+        if user.get("role") == "admin":
+            return
+            
+        new_count = await increment_upload_usage(user["id"], upload_type)
+        
+        if upload_type == "image":
+            limit = await _get_dynamic_limit("free_daily_image_limit", 10)
+            if new_count > limit:
+                raise HTTPException(status_code=429, detail=f"Daily image upload limit reached ({limit}/day).")
+        else:
+            limit = await _get_dynamic_limit("free_daily_doc_limit", 10)
+            if new_count > limit:
+                raise HTTPException(status_code=429, detail=f"Daily document upload limit reached ({limit}/day).")
+        return
+
+    # Guest user
+    fingerprint = request.headers.get("X-Fingerprint", "").strip().lower()
+    if not fingerprint or not _FINGERPRINT_RE.match(fingerprint):
+        raise HTTPException(status_code=400, detail="Browser fingerprint required for guest access.")
+        
+    new_count = await increment_guest_upload_usage(fingerprint, upload_type)
+    
+    if upload_type == "image":
+        limit = await _get_dynamic_limit("guest_image_limit", 2)
+        if new_count > limit:
+            raise HTTPException(status_code=429, detail=f"Guest image upload limit reached ({limit}). Please create a free account.")
+    else:
+        limit = await _get_dynamic_limit("guest_doc_limit", 2)
+        if new_count > limit:
+            raise HTTPException(status_code=429, detail=f"Guest document upload limit reached ({limit}). Please create a free account.")
+

@@ -25,6 +25,7 @@ from google import genai
 from google.genai import types
 
 from app.config import settings
+from app.services.api_keys import api_key_manager
 
 logger = logging.getLogger(__name__)
 
@@ -32,11 +33,10 @@ logger = logging.getLogger(__name__)
 class GeminiEmbedder:
     """
     Wraps gemini-embedding-2 to generate 1536-dim dense vectors.
-    Uses the same GOOGLE_API_KEY already configured for the LLM client.
+    Uses ApiKeyManager to handle rate limits with multiple keys.
     """
 
     def __init__(self):
-        self.client = genai.Client(api_key=settings.GOOGLE_API_KEY)
         self.model = settings.EMBEDDING_MODEL         # "gemini-embedding-2"
         self.dimensions = settings.EMBEDDING_DIMENSIONS  # 1536
         logger.info(
@@ -57,7 +57,8 @@ class GeminiEmbedder:
             List of floats (length = settings.EMBEDDING_DIMENSIONS).
         """
         formatted = f"task: question answering | query: {text}"
-        result = await self.client.aio.models.embed_content(
+        client = api_key_manager.get_current_client()
+        result = await client.aio.models.embed_content(
             model=self.model,
             contents=formatted,
             config=types.EmbedContentConfig(
@@ -109,11 +110,13 @@ class GeminiEmbedder:
                 batch_contents = contents[i:i + batch_size]
                 logger.debug(f"Embedding batch {i // batch_size + 1} of {(len(contents) - 1) // batch_size + 1}...")
 
-                retries = 5
+                retries = max(10, len(api_key_manager.keys) * 3)
                 backoff = 30
+                keys_tried_for_batch = 1
                 for attempt in range(retries):
                     try:
-                        result = await self.client.aio.models.embed_content(
+                        client = api_key_manager.get_current_client()
+                        result = await client.aio.models.embed_content(
                             model=self.model,
                             contents=batch_contents,
                             config=types.EmbedContentConfig(
@@ -129,7 +132,14 @@ class GeminiEmbedder:
                             if attempt == retries - 1:
                                 raise
                             
-                            # Determine sleep time (parse Google API's suggested retry window if present)
+                            # Rotate API key if we have more than one key
+                            if len(api_key_manager.keys) > 1 and keys_tried_for_batch < len(api_key_manager.keys):
+                                api_key_manager.rotate_key()
+                                keys_tried_for_batch += 1
+                                logger.info(f"Retrying batch {i // batch_size + 1} immediately with new API key...")
+                                continue # retry immediately without sleeping
+                            
+                            # We tried all available keys (or only have 1), so we MUST sleep to reset the RPM limits.
                             sleep_seconds = backoff
                             import re
                             # Try matching 'retryDelay': '44s' or 'retryDelay: "44s"'
@@ -143,10 +153,11 @@ class GeminiEmbedder:
                                     sleep_seconds = int(float(match_float.group(1))) + 2
                             
                             logger.warning(
-                                f"Gemini API rate limit (429) hit. Sleeping for {sleep_seconds}s before retrying batch {i // batch_size + 1} (attempt {attempt + 1}/{retries})..."
+                                f"Gemini API rate limit (429) hit on all keys. Sleeping for {sleep_seconds}s before retrying batch {i // batch_size + 1} (attempt {attempt + 1}/{retries})..."
                             )
                             await asyncio.sleep(sleep_seconds)
                             backoff *= 2  # Double the backoff window for next attempt
+                            keys_tried_for_batch = 1  # Reset counter after sleeping
                         else:
                             raise
 

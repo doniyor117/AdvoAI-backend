@@ -25,6 +25,7 @@ from app.services.prompts import (
     SUMMARY_FIRST_MESSAGE_TEMPLATE,
     TITLE_SYSTEM_PROMPT,
     ROUTER_SYSTEM_PROMPT,
+    METADATA_EXTRACTION_SYSTEM_PROMPT,
 )
 
 logger = logging.getLogger(__name__)
@@ -240,6 +241,37 @@ class GeminiClient:
 
         title = response.text.strip().replace('"', "").replace("'", "")
         return title[:255]
+
+    def extract_document_metadata(self, document_header: str) -> Dict[str, Any]:
+        """
+        Uses gemma-4-31b-it to extract structured JSON metadata from a markdown document header.
+        """
+        logger.info("🧠 Requesting metadata extraction from LLM...")
+        
+        config = types.GenerateContentConfig(
+            temperature=0.1,
+            system_instruction=METADATA_EXTRACTION_SYSTEM_PROMPT,
+            response_mime_type="application/json",
+        )
+        
+        response = self._generate_with_retry(
+            model=self.router_model,
+            contents=document_header,
+            config=config
+        )
+        
+        try:
+            metadata = json.loads(response.text)
+            logger.info(f"✅ Extracted metadata: {metadata}")
+            return metadata
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ Failed to parse JSON from LLM: {response.text}")
+            return {
+                "title": "Unknown",
+                "doc_id": None,
+                "doc_date": None,
+                "act_type": "Unknown"
+            }
 
 from functools import lru_cache
 

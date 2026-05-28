@@ -47,7 +47,49 @@ Heavy LLM operations have been successfully decoupled from the HTTP response cyc
 
 ---
 
-## 4. Future Recommendations / Next Steps
+## 4. API Endpoints Catalog
+
+The application exposes the following RESTful endpoints grouped by their respective routers.
+
+### Health (`/api/health`)
+- `GET /api/health/`: Standard health check indicating the API is online.
+- `GET /api/health/db`: Deep health check that verifies the PostgreSQL connection pool is functioning.
+
+### Auth (`/api/auth`)
+- `POST /api/auth/register`: Creates a new user account with a securely hashed password.
+- `POST /api/auth/login`: Authenticates a user and returns an HTTP-only JWT cookie (`advoai_token`).
+- `POST /api/auth/google`: Handles Google OAuth login/registration by verifying Google ID tokens.
+- `POST /api/auth/logout`: Clears the JWT session cookie.
+- `GET /api/auth/me`: Retrieves the currently authenticated user's profile and limits.
+- `PATCH /api/auth/me`: Allows a user to update their profile information.
+
+### Chat (`/api/chat`)
+- `POST /api/chat/`: The core Agentic RAG chat endpoint. Accepts a JSON payload containing the user's `question` and an optional `session_id`. Automatically routes the query, retrieves context, and responds. Rate-limited and utilizes background tasks for history compression.
+
+### Sessions (`/api/sessions`)
+- `GET /api/sessions/`: Lists all chat sessions belonging to the authenticated user.
+- `POST /api/sessions/`: Explicitly creates a new empty chat session.
+- `GET /api/sessions/{session_id}`: Retrieves the full message history (raw messages and summary) for a specific session.
+- `PATCH /api/sessions/{session_id}`: Allows the user to manually rename a chat session.
+- `DELETE /api/sessions/{session_id}`: Permanently deletes a chat session and its history.
+
+### Admin (`/api/admin`) *(Requires `is_admin=True`)*
+- `GET /api/admin/stats`: Returns global system metrics including total users, total queries, and ingested document counts.
+- `GET /api/admin/settings`: Lists dynamic system configurations (e.g., the current active LLM models).
+- `PATCH /api/admin/settings`: Updates dynamic system configurations in the database.
+- `GET /api/admin/users`: Lists all registered users on the platform.
+- `PATCH /api/admin/users/{user_id}/role`: Elevates or demotes a user's role (e.g., granting admin privileges).
+- `PATCH /api/admin/users/{user_id}/ban`: Bans or unbans a user from the platform.
+- `GET /api/admin/users/{user_id}/stats`: Retrieves usage statistics and limits for a specific user.
+- `GET /api/admin/documents`: Lists all ingested Lex.uz legal documents currently in the vector database.
+- `GET /api/admin/documents/{doc_id}`: Retrieves deep metadata and chunk information for a specific document.
+- `PATCH /api/admin/documents/{doc_id}`: Modifies a document's metadata (e.g., toggling its `is_active` status).
+- `DELETE /api/admin/documents/{doc_id}`: Permanently purges a document and all its vector chunks from the database.
+- `POST /api/admin/ingest`: Manually triggers the ingestion pipeline for a new Lex.uz document URL.
+
+---
+
+## 5. Future Recommendations / Next Steps
 
 1. **Async DB Drivers**: Currently, the application uses `psycopg2` (synchronous) combined with FastAPI's `def` routes, which delegates blocking calls to a thread pool. Upgrading to `asyncpg` with `SQLAlchemy 2.0` could increase throughput under extremely high concurrency.
 2. **Dynamic Top-K Expansion**: The RAG pipeline currently accepts a static `top_k`. The Router Agent could be modified to also output an "ideal `top_k`" based on the complexity of the legal query it formulates.

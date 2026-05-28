@@ -114,3 +114,21 @@ Please produce a brief summary of these messages. Keep it concise and factual.
 # ── Chat Title Generation ────────────────────────────────────
 
 TITLE_SYSTEM_PROMPT = """Generate a short, descriptive title (max 6 words) for a chat conversation based on the user's first message. The title should capture the main topic. Respond with ONLY the title, no quotes or extra text. Use the same language as the user's message."""
+
+# ── Ingestion Metadata Extraction ────────────────────────────
+
+METADATA_EXTRACTION_SYSTEM_PROMPT = """You are an expert legal data extraction system.
+Your task is to analyze the provided markdown header of a legal document from Uzbekistan (Lex.uz) and extract the core metadata.
+
+You MUST strictly output a valid JSON object with the following keys and exact types.
+If a piece of information is missing from the text, return null or "Unknown" appropriately.
+
+{
+  "title": "The full title of the legal act, excluding the document number and date.",
+  "doc_id": "The document number or ID if present in the title (e.g., '784-сон' -> '784', 'ЎРҚ-680' -> '680'). Return null if missing.",
+  "doc_date": "The date the document was adopted or enacted, formatted exactly as it appears in the text (e.g. '11.12.2025'). Return null if missing.",
+  "act_type": "The type of legal act (e.g., 'Қонун', 'Қарор', 'Фармон', 'Кодекс'). Extract this from the text if clearly identifiable, else 'Unknown'."
+}
+
+Do NOT wrap the JSON in markdown blocks like ```json ... ```. Output raw JSON only.
+"""

@@ -55,62 +55,11 @@ class LexParser:
                     parent.decompose()
 
     def get_metadata(self) -> Dict[str, Any]:
-        """Extracts legal metadata directly from the HTML structure."""
-        meta = {
+        """Extracts fallback basic metadata. Advanced metadata is extracted later via LLM."""
+        return {
             "source_url": self.url.split("?")[0] if self.url else None,
-            "doc_id": None,
-            "doc_date": None,
-            "act_type": "Unknown",
-            "title": "Untitled Document",
             "is_active": True
         }
-
-        # Attempt to extract doc_id from URL as a fallback
-        if meta["source_url"]:
-            url_match = re.search(r"/docs/-?(\d+)", meta["source_url"])
-            if url_match:
-                meta["doc_id"] = url_match.group(1)
-
-        title_text = ""
-        if self.soup.title:
-            title_text = self.soup.title.get_text(strip=True)
-            
-        # HTML Fallback if <title> is completely empty
-        if not title_text:
-            act_name_tag = self.soup.find(class_=lambda c: c and "ACT_NAME" in c)
-            if act_name_tag:
-                title_text = act_name_tag.get_text(strip=True)
-            else:
-                h1_tag = self.soup.find('h1')
-                if h1_tag:
-                    title_text = h1_tag.get_text(strip=True)
-
-        if title_text:
-            # Replace non-breaking spaces before regex
-            title_text = title_text.replace('\xa0', ' ')
-            
-            # Lex.uz title format: "(optional doc_number) {date}. {actual_title}"
-            # e.g. "784-сон 11.12.2025. Tadbirkorlik subyektlariga..." or "21.12.1995. Ўзбекистон..."
-            match = re.search(r"^(?:(\d+)\s+)?(\d{2}\.\d{2}\.\d{4})\.\s*(.*)", title_text, re.DOTALL)
-            if match:
-                if match.group(1):
-                    meta["doc_id"] = match.group(1)
-                meta["doc_date"] = match.group(2)
-                # The actual title is everything after the date
-                actual_title = match.group(3).strip()
-                if actual_title:
-                    meta["title"] = actual_title
-                else:
-                    meta["title"] = title_text  # fallback to full title
-            else:
-                # No regex match — use the full text
-                meta["title"] = title_text
-
-        act_form = self.soup.find(class_=lambda c: c and "ACT_FORM" in c)
-        if act_form:
-            meta["act_type"] = act_form.get_text(strip=True)
-
-        return meta
 
     def parse(self) -> Dict[str, Any]:
         if not self.soup:

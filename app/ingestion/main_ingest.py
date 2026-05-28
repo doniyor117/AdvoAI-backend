@@ -14,6 +14,7 @@ from typing import Dict, List, Any, Optional
 from app.ingestion.lex_parser import LexParser
 from app.ingestion.chunker import LegalUnstructuredChunker
 from app.services.embedder import get_embedder
+from app.services.llm_client import get_llm_client
 from app.database.queries import check_duplicate, insert_document, insert_document_parts, insert_chunks
 from app.config import settings
 
@@ -110,8 +111,17 @@ def process_and_ingest_law(url: str, skip_db: bool = False) -> Optional[Dict[str
         return None
 
     result = parser.parse()
-    metadata: Dict[str, Any] = result["metadata"]
+    base_metadata: Dict[str, Any] = result["metadata"]
     markdown: str = result["markdown"]
+
+    # Step 2.5: Extract structured metadata using LLM
+    logger.info("Extracting metadata using LLM...")
+    header_text = markdown[:2500]
+    llm_client = get_llm_client()
+    llm_metadata = llm_client.extract_document_metadata(header_text)
+    
+    # Merge metadata
+    metadata = {**base_metadata, **llm_metadata}
 
     logger.info(
         f"Metadata: doc_id={metadata.get('doc_id')}, "
@@ -124,14 +134,17 @@ def process_and_ingest_law(url: str, skip_db: bool = False) -> Optional[Dict[str
     doc_title: str = metadata.get("title", "Unknown")
     logger.info(f"UUID (Root PK): {doc_uuid}")
 
+    # Fallback to source doc ID if LLM couldn't find one
+    final_source_doc_id = metadata.get("doc_id") or source_doc_id
+
     root_document_record: Dict[str, Any] = {
         "id": doc_uuid,
-        "source_doc_id": source_doc_id,
+        "source_doc_id": final_source_doc_id,
         "title": doc_title,
         "act_type": metadata.get("act_type", "Unknown"),
         "doc_date": metadata.get("doc_date"),
-        "source_url": url.split("?")[0],
-        "is_active": metadata.get("is_active", True),
+        "source_url": base_metadata.get("source_url", url.split("?")[0]),
+        "is_active": base_metadata.get("is_active", True),
     }
 
     # Step 4: Split into Mega-Chunks (document_parts)

@@ -19,6 +19,7 @@ Ref: https://ai.google.dev/gemini-api/docs/embeddings
 import logging
 from functools import lru_cache
 from typing import List, Dict, Any
+import asyncio
 
 from google import genai
 from google.genai import types
@@ -42,7 +43,7 @@ class GeminiEmbedder:
             f"GeminiEmbedder initialized: model={self.model}, dimensions={self.dimensions}"
         )
 
-    def embed_query(self, text: str) -> List[float]:
+    async def embed_query(self, text: str) -> List[float]:
         """
         Embeds a user search query.
 
@@ -56,7 +57,7 @@ class GeminiEmbedder:
             List of floats (length = settings.EMBEDDING_DIMENSIONS).
         """
         formatted = f"task: question answering | query: {text}"
-        result = self.client.models.embed_content(
+        result = await self.client.aio.models.embed_content(
             model=self.model,
             contents=formatted,
             config=types.EmbedContentConfig(
@@ -65,7 +66,7 @@ class GeminiEmbedder:
         )
         return list(result.embeddings[0].values)
 
-    def embed_chunks(
+    async def embed_chunks(
         self,
         chunks: List[Dict[str, Any]],
         doc_title: str = "none",
@@ -112,7 +113,7 @@ class GeminiEmbedder:
                 backoff = 30
                 for attempt in range(retries):
                     try:
-                        result = self.client.models.embed_content(
+                        result = await self.client.aio.models.embed_content(
                             model=self.model,
                             contents=batch_contents,
                             config=types.EmbedContentConfig(
@@ -144,8 +145,7 @@ class GeminiEmbedder:
                             logger.warning(
                                 f"Gemini API rate limit (429) hit. Sleeping for {sleep_seconds}s before retrying batch {i // batch_size + 1} (attempt {attempt + 1}/{retries})..."
                             )
-                            import time
-                            time.sleep(sleep_seconds)
+                            await asyncio.sleep(sleep_seconds)
                             backoff *= 2  # Double the backoff window for next attempt
                         else:
                             raise

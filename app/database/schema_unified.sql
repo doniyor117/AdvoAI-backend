@@ -144,4 +144,18 @@ ON CONFLICT (key) DO NOTHING;
 -- Safely add is_banned column to users (idempotent)
 ALTER TABLE public.users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT FALSE;
 
+-- ──────────────────────────────────────────────────────────────
+-- V4: Analytics & Logging
+-- ──────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS public.router_analytics (
+    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id      uuid REFERENCES public.chat_sessions(id) ON DELETE CASCADE,
+    raw_query       text NOT NULL,
+    intent          varchar(50) NOT NULL,
+    optimized_query text,
+    ideal_top_k     integer,
+    created_at      timestamptz DEFAULT NOW()
+);
+
 COMMIT;

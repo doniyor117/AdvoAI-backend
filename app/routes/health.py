@@ -9,14 +9,14 @@ import logging
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
-from app.database.connection import get_cursor
+from app.database.connection import get_connection
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
 @router.get("/")
-def health_check():
+async def health_check():
     """
     Basic health check. Simply verifies the FastAPI server is reachable.
     """
@@ -24,7 +24,7 @@ def health_check():
 
 
 @router.get("/db")
-def database_health_check():
+async def database_health_check():
     """
     Deep health check. Attempts to connect to the PostgreSQL database.
     """
@@ -35,8 +35,8 @@ def database_health_check():
         # get_cursor() borrows from the pool and automatically returns it.
         # It will raise an exception if it fails to connect.
         from contextlib import closing
-        with get_cursor() as cur:
-            cur.execute("SELECT 1")
+        async with get_connection() as cur:
+            await cur.execute("SELECT 1")
     except Exception as e:
         status = "unhealthy"
         message = f"Database connection failed: {str(e)}"

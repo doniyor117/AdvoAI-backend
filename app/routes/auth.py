@@ -60,9 +60,9 @@ def _verify_password(password: str, hashed: str) -> bool:
     return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
 
 
-def _set_auth_cookie(response: Response, user_id: str) -> str:
+def _set_auth_cookie(response: Response, user_id: str, role: str) -> str:
     """Creates JWT and sets it as an HTTP-only cookie."""
-    token = create_access_token({"sub": user_id})
+    token = create_access_token({"sub": user_id, "role": role})
     is_production = settings.ENVIRONMENT != "development"
     response.set_cookie(
         key="advoai_token",
@@ -90,18 +90,18 @@ def _user_to_response(user: dict) -> dict:
 # ── Routes ───────────────────────────────────────────────────
 
 @router.post("/register")
-def register(request: RegisterRequest, response: Response):
+async def register(request: RegisterRequest, response: Response):
     """
     Register a new user with email and password.
     """
     # Check if email already exists
-    existing = get_user_by_email(request.email)
+    existing = await get_user_by_email(request.email)
     if existing:
         raise HTTPException(status_code=409, detail="An account with this email already exists.")
 
     # Create user
     password_hash = _hash_password(request.password)
-    user = create_user(
+    user = await create_user(
         email=request.email,
         password_hash=password_hash,
         full_name=request.full_name,
@@ -112,8 +112,8 @@ def register(request: RegisterRequest, response: Response):
         raise HTTPException(status_code=500, detail="Failed to create account. Please try again.")
 
     # Set auth cookie + return token in body
-    token = _set_auth_cookie(response, str(user["id"]))
-    update_last_login(str(user["id"]))
+    token = _set_auth_cookie(response, str(user["id"]), user.get("role", "guest"))
+    await update_last_login(str(user["id"]))
 
     logger.info(f"New user registered: {request.email}")
 
@@ -125,11 +125,11 @@ def register(request: RegisterRequest, response: Response):
 
 
 @router.post("/login")
-def login(request: LoginRequest, response: Response):
+async def login(request: LoginRequest, response: Response):
     """
     Login with email and password.
     """
-    user = get_user_by_email(request.email)
+    user = await get_user_by_email(request.email)
 
     if not user:
         raise HTTPException(status_code=401, detail="Invalid email or password.")
@@ -147,8 +147,8 @@ def login(request: LoginRequest, response: Response):
         raise HTTPException(status_code=403, detail="Account is deactivated.")
 
     # Set auth cookie + return token in body
-    token = _set_auth_cookie(response, str(user["id"]))
-    update_last_login(str(user["id"]))
+    token = _set_auth_cookie(response, str(user["id"]), user.get("role", "guest"))
+    await update_last_login(str(user["id"]))
 
     logger.info(f"User logged in: {request.email}")
 
@@ -160,7 +160,7 @@ def login(request: LoginRequest, response: Response):
 
 
 @router.post("/google")
-def google_auth(request: GoogleAuthRequest, response: Response):
+async def google_auth(request: GoogleAuthRequest, response: Response):
     """
     Authenticate via Google OAuth.
     Verifies the Google ID token, creates or links the user account.
@@ -172,8 +172,10 @@ def google_auth(request: GoogleAuthRequest, response: Response):
         raise HTTPException(status_code=501, detail="Google OAuth is not configured.")
 
     try:
-        # Verify the Google ID token
-        idinfo = id_token.verify_oauth2_token(
+        import asyncio
+        # Verify the Google ID token in a separate thread to prevent blocking
+        idinfo = await asyncio.to_thread(
+            id_token.verify_oauth2_token,
             request.credential,
             google_requests.Request(),
             settings.GOOGLE_CLIENT_ID,
@@ -188,18 +190,18 @@ def google_auth(request: GoogleAuthRequest, response: Response):
         raise HTTPException(status_code=401, detail="Invalid Google credential.")
 
     # Check if user already exists by Google ID
-    user = get_user_by_google_id(google_id)
+    user = await get_user_by_google_id(google_id)
 
     if not user:
         # Check if user exists by email (might have registered with email first)
-        user = get_user_by_email(email)
+        user = await get_user_by_email(email)
         if user:
             # Link Google ID to existing account
             from app.database.queries import link_google_id
-            link_google_id(str(user["id"]), google_id)
+            await link_google_id(str(user["id"]), google_id)
         else:
             # Create new user via Google
-            user = create_user(
+            user = await create_user(
                 email=email,
                 full_name=full_name,
                 auth_provider="google",
@@ -210,8 +212,8 @@ def google_auth(request: GoogleAuthRequest, response: Response):
     if not user:
         raise HTTPException(status_code=500, detail="Failed to process Google sign-in.")
 
-    token = _set_auth_cookie(response, str(user["id"]))
-    update_last_login(str(user["id"]))
+    token = _set_auth_cookie(response, str(user["id"]), user.get("role", "guest"))
+    await update_last_login(str(user["id"]))
 
     logger.info(f"Google auth: {email}")
 
@@ -223,7 +225,7 @@ def google_auth(request: GoogleAuthRequest, response: Response):
 
 
 @router.post("/logout")
-def logout(response: Response):
+async def logout(response: Response):
     """
     Clears the auth cookie.
     """
@@ -257,10 +259,10 @@ async def update_me(request: Request, body: UpdateProfileRequest):
         raise HTTPException(status_code=401, detail="Not authenticated.")
 
     from app.database.queries import update_user_profile
-    update_user_profile(str(user["id"]), full_name=body.full_name)
+    await update_user_profile(str(user["id"]), full_name=body.full_name)
 
     # Fetch updated user
-    updated = get_user_by_id(str(user["id"]))
+    updated = await get_user_by_id(str(user["id"]))
     logger.info(f"User profile updated: {user['email']}")
 
     return {"message": "Profile updated.", "user": _user_to_response(updated)}

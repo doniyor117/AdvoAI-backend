@@ -34,25 +34,25 @@ class UpdateSessionRequest(BaseModel):
 # ── Routes ───────────────────────────────────────────────────
 
 @router.get("")
-def list_sessions(user=Depends(require_auth)):
+async def list_sessions(user=Depends(require_auth)):
     """Lists all sessions for the authenticated user."""
-    sessions = get_user_sessions(user["id"])
+    sessions = await get_user_sessions(user["id"])
     return {"sessions": sessions}
 
 
 @router.post("")
-def new_session(request: CreateSessionRequest, user=Depends(require_auth)):
+async def new_session(request: CreateSessionRequest, user=Depends(require_auth)):
     """Creates a new chat session."""
-    session = create_session(user["id"], request.title)
+    session = await create_session(user["id"], request.title)
     if not session:
         raise HTTPException(status_code=500, detail="Failed to create session.")
     return {"session": session}
 
 
 @router.get("/{session_id}")
-def get_session(session_id: str, user=Depends(require_auth)):
+async def get_session(session_id: str, user=Depends(require_auth)):
     """Gets a specific session by ID."""
-    session = get_session_by_id(session_id)
+    session = await get_session_by_id(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
     if session["user_id"] != user["id"]:
@@ -61,31 +61,31 @@ def get_session(session_id: str, user=Depends(require_auth)):
 
 
 @router.patch("/{session_id}")
-def update_session(session_id: str, request: UpdateSessionRequest, user=Depends(require_auth)):
+async def update_session(session_id: str, request: UpdateSessionRequest, user=Depends(require_auth)):
     """Updates a session (rename or toggle pin)."""
-    session = get_session_by_id(session_id)
+    session = await get_session_by_id(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
     if session["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Access denied.")
 
     if request.title is not None:
-        rename_session(session_id, request.title)
+        await rename_session(session_id, request.title)
     if request.toggle_pin:
-        toggle_pin_session(session_id)
+        await toggle_pin_session(session_id)
 
-    updated = get_session_by_id(session_id)
+    updated = await get_session_by_id(session_id)
     return {"session": updated}
 
 
 @router.delete("/{session_id}")
-def remove_session(session_id: str, user=Depends(require_auth)):
+async def remove_session(session_id: str, user=Depends(require_auth)):
     """Deletes a chat session."""
-    session = get_session_by_id(session_id)
+    session = await get_session_by_id(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
     if session["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Access denied.")
 
-    delete_session(session_id)
+    await delete_session(session_id)
     return {"message": "Session deleted."}

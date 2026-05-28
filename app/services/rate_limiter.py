@@ -18,15 +18,13 @@ logger = logging.getLogger(__name__)
 # Valid fingerprint: hex string, 16–64 chars
 _FINGERPRINT_RE = re.compile(r"^[a-f0-9]{16,64}$")
 
-def _get_dynamic_limit(key: str, fallback: int) -> int:
+async def _get_dynamic_limit(key: str, fallback: int) -> int:
     """Reads a limit from the system_settings table, with .env fallback."""
     try:
-        val = get_setting(key)
-        if val is not None:
-            return int(val)
+        val = await get_setting(key)
+        return int(val) if val is not None else fallback
     except Exception:
-        pass
-    return fallback
+        return fallback
 
 async def check_rate_limit(
     request: Request,
@@ -58,10 +56,10 @@ async def check_rate_limit(
                 detail="Your account has been suspended. Please contact support."
             )
 
-        free_daily_limit = _get_dynamic_limit("free_daily_limit", settings.FREE_DAILY_LIMIT)
+        free_daily_limit = await _get_dynamic_limit("free_daily_limit", settings.FREE_DAILY_LIMIT)
 
         # Atomic increment — get new count after insert/update
-        new_count = increment_usage(user["id"])
+        new_count = await increment_usage(user["id"])
 
         # Check after incrementing: if the new count exceeds limit, reject
         if new_count > free_daily_limit:
@@ -91,7 +89,7 @@ async def check_rate_limit(
     guest_limit = _get_dynamic_limit("guest_message_limit", settings.GUEST_MESSAGE_LIMIT)
 
     # Atomic increment — get new count after insert/update
-    new_count = increment_guest_usage(fingerprint)
+    new_count = await increment_guest_usage(fingerprint)
 
     if new_count > guest_limit:
         raise HTTPException(

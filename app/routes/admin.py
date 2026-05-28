@@ -47,7 +47,7 @@ class UpdateDocTitleRequest(BaseModel):
 # ── Dashboard ────────────────────────────────────────────────
 
 @router.get("/stats")
-def dashboard_stats(user=Depends(require_admin)):
+async def dashboard_stats(user=Depends(require_admin)):
     """Returns aggregated statistics for the admin dashboard."""
     stats = get_admin_stats()
     return {"stats": stats}
@@ -56,14 +56,14 @@ def dashboard_stats(user=Depends(require_admin)):
 # ── System Settings ──────────────────────────────────────────
 
 @router.get("/settings")
-def get_settings(user=Depends(require_admin)):
+async def get_settings(user=Depends(require_admin)):
     """Returns all system settings."""
     settings = get_all_settings()
     return {"settings": settings}
 
 
 @router.patch("/settings")
-def update_settings(request: UpdateSettingsRequest, user=Depends(require_admin)):
+async def update_settings(request: UpdateSettingsRequest, user=Depends(require_admin)):
     """Updates system settings (partial update)."""
     updated = []
     if request.current_llm_model is not None:
@@ -82,20 +82,20 @@ def update_settings(request: UpdateSettingsRequest, user=Depends(require_admin))
 # ── Users ────────────────────────────────────────────────────
 
 @router.get("/users")
-def list_users(user=Depends(require_admin)):
+async def list_users(user=Depends(require_admin)):
     """Lists all users with their usage data."""
     users = get_all_users()
     return {"users": users}
 
 
 @router.patch("/users/{user_id}/role")
-def change_user_role(user_id: str, request: UpdateRoleRequest, user=Depends(require_admin)):
+async def change_user_role(user_id: str, request: UpdateRoleRequest, user=Depends(require_admin)):
     """Changes a user's role."""
     if request.role not in ("guest", "free", "admin"):
         raise HTTPException(status_code=400, detail="Invalid role. Must be 'guest', 'free', or 'admin'.")
 
     try:
-        update_user_role(user_id, request.role)
+        await update_user_role(user_id, request.role)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -103,7 +103,7 @@ def change_user_role(user_id: str, request: UpdateRoleRequest, user=Depends(requ
 
 
 @router.patch("/users/{user_id}/ban")
-def ban_user(user_id: str, user=Depends(require_admin)):
+async def ban_user(user_id: str, user=Depends(require_admin)):
     """Toggles the ban status of a user."""
     new_status = toggle_ban_user(user_id)
     action = "banned" if new_status else "unbanned"
@@ -111,23 +111,23 @@ def ban_user(user_id: str, user=Depends(require_admin)):
 
 
 @router.get("/users/{user_id}/stats")
-def user_stats(user_id: str, user=Depends(require_admin)):
+async def user_stats(user_id: str, user=Depends(require_admin)):
     """Returns usage statistics for a specific user."""
-    stats = get_user_stats(user_id)
+    stats = await get_user_stats(user_id)
     return {"stats": stats}
 
 
 # ── Documents ────────────────────────────────────────────────
 
 @router.get("/documents")
-def list_documents(user=Depends(require_admin)):
+async def list_documents(user=Depends(require_admin)):
     """Lists all ingested documents with metadata."""
     documents = get_all_documents_admin()
     return {"documents": documents}
 
 
 @router.get("/documents/{doc_id}")
-def view_document(doc_id: str, user=Depends(require_admin)):
+async def view_document(doc_id: str, user=Depends(require_admin)):
     """Gets a single document with its full markdown content."""
     doc = get_document_full(doc_id)
     if not doc:
@@ -136,7 +136,7 @@ def view_document(doc_id: str, user=Depends(require_admin)):
 
 
 @router.patch("/documents/{doc_id}")
-def edit_document(doc_id: str, request: UpdateDocTitleRequest, user=Depends(require_admin)):
+async def edit_document(doc_id: str, request: UpdateDocTitleRequest, user=Depends(require_admin)):
     """Updates a document's title."""
     doc = get_document_full(doc_id)
     if not doc:
@@ -146,12 +146,12 @@ def edit_document(doc_id: str, request: UpdateDocTitleRequest, user=Depends(requ
 
 
 @router.delete("/documents/{doc_id}")
-def remove_document(doc_id: str, user=Depends(require_admin)):
+async def remove_document(doc_id: str, user=Depends(require_admin)):
     """Deletes a document and all its associated chunks (CASCADE)."""
     doc = get_document_full(doc_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found.")
-    delete_document(doc_id)
+    await delete_document(doc_id)
     logger.info(f"Admin deleted document {doc_id} ({doc['source_doc_id']})")
     return {"message": "Document and all associated chunks deleted."}
 
@@ -159,7 +159,7 @@ def remove_document(doc_id: str, user=Depends(require_admin)):
 # ── Ingestion ────────────────────────────────────────────────
 
 @router.post("/ingest")
-def trigger_ingest(request: IngestRequest, user=Depends(require_admin)):
+async def trigger_ingest(request: IngestRequest, user=Depends(require_admin)):
     """
     Triggers document ingestion from a Lex.uz URL.
     This is a synchronous operation — the request will block until complete.
@@ -167,7 +167,7 @@ def trigger_ingest(request: IngestRequest, user=Depends(require_admin)):
     logger.info(f"Admin {user['email']} triggered ingestion for: {request.url}")
 
     try:
-        result = process_and_ingest_law(request.url)
+        result = await process_and_ingest_law(request.url)
         return {
             "status": "success",
             "message": "Document ingested successfully.",

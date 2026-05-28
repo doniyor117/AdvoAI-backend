@@ -1,7 +1,43 @@
 import pytest
 import uuid
-from app.ingestion.main_ingest import _split_markdown_into_parts, MAX_PART_SIZE, TARGET_SPLIT_SIZE
+from unittest.mock import patch, MagicMock, AsyncMock
+from app.ingestion.main_ingest import _split_markdown_into_parts, MAX_PART_SIZE, TARGET_SPLIT_SIZE, process_and_ingest_law
 from app.ingestion.chunker import LegalUnstructuredChunker
+
+@patch('app.ingestion.main_ingest.get_embedder')
+@patch('app.ingestion.main_ingest.get_llm_client')
+@patch('app.ingestion.main_ingest.LexParser')
+@patch('app.ingestion.main_ingest.check_duplicate', new_callable=AsyncMock)
+@patch('app.ingestion.main_ingest.insert_document', new_callable=AsyncMock)
+@patch('app.ingestion.main_ingest.insert_document_parts', new_callable=AsyncMock)
+@patch('app.ingestion.main_ingest.insert_chunks', new_callable=AsyncMock)
+@pytest.mark.asyncio
+async def test_process_and_ingest_law(mock_insert_chunks, mock_insert_parts, mock_insert_doc, mock_check_dup, mock_extractor, mock_llm, mock_embedder):
+    # Setup mocks
+    mock_check_dup.return_value = False
+    
+    # Mocking parser
+    mock_parser_instance = MagicMock()
+    mock_parser_instance.fetch_html.return_value = True
+    mock_parser_instance.parse.return_value = {
+        "metadata": {"title": "Test Law"},
+        "markdown": "This is a test law markdown.",
+        "html": "<p>Test</p>"
+    }
+    mock_extractor.return_value = mock_parser_instance
+
+    # Mocking LLM
+    mock_llm_instance = AsyncMock()
+    mock_llm_instance.extract_document_metadata.return_value = {"date": "2023-01-01"}
+    mock_llm.return_value = mock_llm_instance
+
+    # Mocking Embedder
+    mock_embed_instance = AsyncMock()
+    mock_embed_instance.embed_chunks.return_value = [{"text": "chunk", "embedding": [0.1]}]
+    mock_embedder.return_value = mock_embed_instance
+    
+    # Execute
+    await process_and_ingest_law("https://lex.uz/docs/12345")
 
 def test_split_markdown_no_split():
     # If the markdown is smaller than MAX_PART_SIZE, it shouldn't split

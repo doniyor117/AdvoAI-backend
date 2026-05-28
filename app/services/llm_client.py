@@ -8,6 +8,7 @@ Handles RAG QA with Gemini 3.1 Pro/Flash, and Query Intent Routing
 import logging
 import json
 import re
+import asyncio
 import time
 from typing import Dict, Any
 
@@ -46,11 +47,11 @@ class GeminiClient:
         logger.info(f"🤖 Main LLM initialized: {self.main_model}")
         logger.info(f"🧠 Router LLM initialized: {self.router_model}")
 
-    def _generate_with_retry(self, model: str, contents: Any, config: Any, max_retries: int = 3):
+    async def _generate_with_retry(self, model: str, contents: Any, config: Any, max_retries: int = 3):
         """Helper to execute generate_content with exponential backoff retries."""
         for attempt in range(max_retries):
             try:
-                return self.client.models.generate_content(
+                return await self.client.aio.models.generate_content(
                     model=model,
                     contents=contents,
                     config=config,
@@ -61,9 +62,9 @@ class GeminiClient:
                     raise
                 wait_time = 2 ** attempt
                 logger.warning(f"⚠️ LLM API error: {e}. Retrying in {wait_time}s... (Attempt {attempt+1}/{max_retries})")
-                time.sleep(wait_time)
+                await asyncio.sleep(wait_time)
 
-    def route_query(self, question: str) -> Dict[str, str]:
+    async def route_query(self, question: str, recent_messages: list = None) -> Dict[str, str]:
         """
         Uses gemma-4-31b-it to classify the query as 'conversational' or 'legal_rag'.
         Returns a dict: {"intent": "...", "search_query": "..."}
@@ -73,12 +74,20 @@ class GeminiClient:
         config = types.GenerateContentConfig(
             system_instruction=ROUTER_SYSTEM_PROMPT,
             temperature=0.0,  # Zero temperature for strict instruction following
-            thinking_config=types.ThinkingConfig(include_thoughts=True)
+            thinking_config=types.ThinkingConfig(thinking_level="MINIMAL")
         )
         
-        response = self._generate_with_retry(
+        prompt = question
+        if recent_messages:
+            history_text = "\n".join(
+                f"{msg['role'].capitalize()}: {msg['content']}" 
+                for msg in recent_messages
+            )
+            prompt = f"Recent Conversation History:\n{history_text}\n\nCurrent Query: {question}"
+
+        response = await self._generate_with_retry(
             model=self.router_model,
-            contents=question,
+            contents=prompt,
             config=config,
         )
         
@@ -112,7 +121,7 @@ class GeminiClient:
             return {"intent": "conversational", "search_query": ""}
         return {"intent": "legal_rag", "search_query": question}
 
-    def ask(
+    async def ask(
         self,
         question: str,
         structured_history: list[Dict[str, Any]] = None,
@@ -171,7 +180,7 @@ class GeminiClient:
             system_instruction=SYSTEM_PROMPT
         )
 
-        response = self._generate_with_retry(
+        response = await self._generate_with_retry(
             model=self.main_model,
             contents=payload,
             config=config
@@ -187,7 +196,7 @@ class GeminiClient:
             "prompt_length": len(final_prompt),
         }
 
-    def summarize_archive(
+    async def summarize_archive(
         self,
         old_messages: str,
         previous_summary: str = "",
@@ -211,7 +220,7 @@ class GeminiClient:
             thinking_config=types.ThinkingConfig(include_thoughts=True)
         )
         
-        response = self._generate_with_retry(
+        response = await self._generate_with_retry(
             model=self.router_model,
             contents=prompt,
             config=config
@@ -229,9 +238,9 @@ class GeminiClient:
         logger.info(f"📋 Archive Summary updated ({len(summary)} chars)")
         return summary
 
-    def generate_title(self, first_message: str) -> str:
+    async def generate_title(self, first_message: str) -> str:
         """Generates a short chat title from the user's first message."""
-        response = self.client.models.generate_content(
+        response = await self._generate_with_retry(
             model=self.main_model,
             contents=first_message,
             config=types.GenerateContentConfig(
@@ -242,7 +251,7 @@ class GeminiClient:
         title = response.text.strip().replace('"', "").replace("'", "")
         return title[:255]
 
-    def extract_document_metadata(self, document_header: str) -> Dict[str, Any]:
+    async def extract_document_metadata(self, document_header: str) -> Dict[str, Any]:
         """
         Uses gemma-4-31b-it to extract structured JSON metadata from a markdown document header.
         """
@@ -254,7 +263,7 @@ class GeminiClient:
             response_mime_type="application/json",
         )
         
-        response = self._generate_with_retry(
+        response = await self._generate_with_retry(
             model=self.router_model,
             contents=document_header,
             config=config
@@ -273,13 +282,18 @@ class GeminiClient:
                 "act_type": "Unknown"
             }
 
-from functools import lru_cache
+_llm_client_instance = None
 
-@lru_cache(maxsize=1)
-def get_llm_client() -> GeminiClient:
+async def get_llm_client() -> GeminiClient:
     """Returns a cached singleton GeminiClient based on system settings."""
+    global _llm_client_instance
+    if _llm_client_instance is not None:
+        return _llm_client_instance
+
     from app.database.queries import get_setting
     # Allow fallback if setting doesn't exist
-    main_model = get_setting("current_llm_model") or "gemini-3.1-flash-lite"
+    main_model = await get_setting("current_llm_model") or "gemini-3.1-flash-lite"
     router_model = "gemma-4-31b-it" # Hardcoded specialized router
-    return GeminiClient(main_model=main_model, router_model=router_model)
+    
+    _llm_client_instance = GeminiClient(main_model=main_model, router_model=router_model)
+    return _llm_client_instance

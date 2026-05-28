@@ -67,7 +67,7 @@ async def get_current_user(request: Request) -> Optional[Dict[str, Any]]:
         return None
 
     from app.database.queries import get_user_by_id
-    user = get_user_by_id(payload.get("sub"))
+    user = await get_user_by_id(payload.get("sub"))
     if not user or not user.get("is_active"):
         return None
 

@@ -1,47 +1,70 @@
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 from app.services.llm_client import GeminiClient
 from google.genai import types
 
+@pytest.mark.asyncio
 @patch('app.services.llm_client.genai.Client')
-def test_route_query_conversational(mock_genai_client):
+async def test_route_query_conversational(mock_genai_client):
     mock_instance = mock_genai_client.return_value
     mock_response = MagicMock()
     mock_response.candidates = None
     mock_response.text = '{"intent": "conversational"}'
-    mock_instance.models.generate_content.return_value = mock_response
+    mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_response)
     
     client = GeminiClient(main_model="gemini-3.1", router_model="gemma-4")
-    routing_data = client.route_query("Hi there")
+    routing_data = await client.route_query("Hi there")
     
     assert routing_data["intent"] == "conversational"
     assert routing_data["search_query"] == ""
-    mock_instance.models.generate_content.assert_called_once()
-    args, kwargs = mock_instance.models.generate_content.call_args
+    mock_instance.aio.models.generate_content.assert_called_once()
+    args, kwargs = mock_instance.aio.models.generate_content.call_args
     assert kwargs["model"] == "gemma-4"
 
+@pytest.mark.asyncio
 @patch('app.services.llm_client.genai.Client')
-def test_route_query_legal_rag(mock_genai_client):
+async def test_route_query_legal_rag(mock_genai_client):
     mock_instance = mock_genai_client.return_value
     mock_response = MagicMock()
     mock_response.candidates = None
     mock_response.text = '{"intent": "legal_rag", "search_query": "contract penalty"}'
-    mock_instance.models.generate_content.return_value = mock_response
+    mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_response)
     
     client = GeminiClient(main_model="gemini-3.1", router_model="gemma-4")
-    routing_data = client.route_query("What is the penalty for breaching a contract?")
+    routing_data = await client.route_query("What is the penalty for breaching a contract?")
     
     assert routing_data["intent"] == "legal_rag"
     assert routing_data["search_query"] == "contract penalty"
 
+@pytest.mark.asyncio
 @patch('app.services.llm_client.genai.Client')
-def test_ask_method(mock_genai_client):
+async def test_route_query_with_history(mock_genai_client):
+    mock_instance = mock_genai_client.return_value
+    mock_response = MagicMock()
+    mock_response.candidates = None
+    mock_response.text = '{"intent": "legal_rag", "search_query": "civil code details"}'
+    mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_response)
+    
+    client = GeminiClient(main_model="gemini-3.1", router_model="gemma-4")
+    history = [{"role": "assistant", "content": "The Civil Code is..."}, {"role": "user", "content": "What is it?"}]
+    routing_data = await client.route_query("Do you know anything else about it?", recent_messages=history)
+    
+    assert routing_data["intent"] == "legal_rag"
+    args, kwargs = mock_instance.aio.models.generate_content.call_args
+    # Verify history was prepended
+    assert "Recent Conversation History" in kwargs["contents"]
+    assert "Assistant: The Civil Code" in kwargs["contents"]
+    assert "Current Query: Do you know anything else about it?" in kwargs["contents"]
+
+@pytest.mark.asyncio
+@patch('app.services.llm_client.genai.Client')
+async def test_ask_method(mock_genai_client):
     mock_instance = mock_genai_client.return_value
     mock_response = MagicMock()
     mock_response.text = "This is the answer"
     mock_response.usage_metadata.candidates_token_count = 10
     mock_response.usage_metadata.prompt_token_count = 5
-    mock_instance.models.generate_content.return_value = mock_response
+    mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_response)
     
     client = GeminiClient(main_model="gemini-3.1", router_model="gemma-4")
     
@@ -51,7 +74,7 @@ def test_ask_method(mock_genai_client):
         {"role": "assistant", "content": "Answer 1"}
     ]
     
-    result = client.ask(
+    result = await client.ask(
         question="Question 2",
         structured_history=history,
         context_markdown="Context",
@@ -62,7 +85,7 @@ def test_ask_method(mock_genai_client):
     assert result["answer"] == "This is the answer"
     assert result["model"] == "gemini-3.1"
     
-    args, kwargs = mock_instance.models.generate_content.call_args
+    args, kwargs = mock_instance.aio.models.generate_content.call_args
     assert kwargs["model"] == "gemini-3.1"
     
     # Assert structured history was mapped correctly
@@ -75,16 +98,17 @@ def test_ask_method(mock_genai_client):
     # Ensure context markdown is in the final message
     assert "Context" in contents[2]["parts"][0]["text"]
 
+@pytest.mark.asyncio
 @patch('app.services.llm_client.genai.Client')
-def test_ask_conversational(mock_genai_client):
+async def test_ask_conversational(mock_genai_client):
     mock_instance = mock_genai_client.return_value
     mock_response = MagicMock()
     mock_response.text = "Hello!"
-    mock_instance.models.generate_content.return_value = mock_response
+    mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_response)
     
     client = GeminiClient(main_model="gemini-3.1")
     
-    result = client.ask(
+    result = await client.ask(
         question="Hello",
         structured_history=[],
         context_markdown="",

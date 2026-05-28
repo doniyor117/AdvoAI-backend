@@ -34,11 +34,11 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Manages startup and shutdown of the database connection pool."""
     from app.database.connection import init_pool, close_pool
-    logger.info("Starting up AdvoAI API...")
-    init_pool()
+    logger.info("AdvoAI Backend starting up...")
+    await init_pool()
     yield
-    logger.info("Shutting down AdvoAI API...")
-    close_pool()
+    logger.info("AdvoAI Backend shutting down...")
+    await close_pool()
 
 
 # ── FastAPI App ───────────────────────────────────────────────

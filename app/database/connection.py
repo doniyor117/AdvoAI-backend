@@ -1,147 +1,152 @@
 """
 connection.py — Database Connection Manager
 
-Provides a thread-safe PostgreSQL connection pool using psycopg2.
+Provides an async PostgreSQL connection pool using asyncpg.
 Reads DATABASE_URL from Pydantic settings (loaded from .env).
 
 Pool lifecycle is managed by FastAPI's lifespan (see main.py).
 
 Usage:
-    from app.database.connection import get_cursor
+    from app.database.connection import get_connection
 
-    with get_cursor() as cur:
-        cur.execute("SELECT * FROM documents")
-        rows = cur.fetchall()  # Returns list of RealDictRow (acts like dict)
+    async with get_connection() as conn:
+        rows = await conn.fetch("SELECT * FROM documents")
+        # Returns list of asyncpg.Record (acts like dict)
 """
 
 import logging
-from contextlib import contextmanager
-from typing import Generator
+from contextlib import asynccontextmanager
 
-import psycopg2
-import psycopg2.pool
-import psycopg2.extras
-from pgvector.psycopg2 import register_vector
+import asyncpg
+from pgvector.asyncpg import register_vector
 
 logger = logging.getLogger(__name__)
 
 # Module-level pool — initialized by init_pool(), torn down by close_pool()
-_pool: psycopg2.pool.ThreadedConnectionPool | None = None
+_pool: asyncpg.Pool | None = None
 
 
-def init_pool() -> None:
+async def init_pool() -> None:
     """
-    Creates the connection pool. Called once at application startup via lifespan.
-    Registers pgvector on a test connection to validate the extension is present.
+    Creates the connection pool asynchronously. Called at application startup via lifespan.
+    Registers pgvector on connections to validate the extension is present.
     """
     global _pool
     from app.config import settings
 
-    logger.info("Initializing database connection pool...")
-    _pool = psycopg2.pool.ThreadedConnectionPool(
-        minconn=2,
-        maxconn=10,
+    logger.info("Initializing asyncpg connection pool...")
+    
+    async def init_connection(conn):
+        await register_vector(conn)
+        
+    _pool = await asyncpg.create_pool(
         dsn=settings.DATABASE_URL,
+        min_size=2,
+        max_size=10,
+        init=init_connection
     )
 
-    # Validate connection and register vector type on a test conn
-    conn = _pool.getconn()
-    try:
-        register_vector(conn)
-        conn.commit()
-        logger.info("Database pool initialized. pgvector extension verified.")
-    finally:
-        _pool.putconn(conn)
+    logger.info("Database pool initialized. pgvector async extension verified.")
 
 
-def close_pool() -> None:
+import re
+
+async def close_pool() -> None:
     """
     Closes all connections in the pool. Called at application shutdown via lifespan.
     """
     global _pool
     if _pool:
-        _pool.closeall()
+        await _pool.close()
         _pool = None
         logger.info("Database connection pool closed.")
 
 
-@contextmanager
-def get_cursor(autocommit: bool = False, max_retries: int = 3) -> Generator:
+def _adapt_sql(sql: str, params=None) -> tuple[str, list]:
+    if params is None:
+        return sql, []
+    
+    if isinstance(params, dict):
+        args = []
+        def repl(m):
+            key = m.group(1)
+            if key not in params:
+                raise KeyError(f"Missing parameter {key}")
+            args.append(params[key])
+            return f"${len(args)}"
+        new_sql = re.sub(r"%\(([^)]+)\)s", repl, sql)
+        return new_sql, args
+    elif isinstance(params, (list, tuple)):
+        args = list(params)
+        def repl(m):
+            if not hasattr(repl, "count"):
+                repl.count = 0
+            repl.count += 1
+            return f"${repl.count}"
+        new_sql = re.sub(r"%s", repl, sql)
+        return new_sql, args
+    else:
+        return sql, [params]
+
+
+class AsyncCursor:
+    def __init__(self, conn):
+        self.conn = conn
+        self._last_result = None
+
+    async def execute(self, sql: str, params=None):
+        new_sql, args = _adapt_sql(sql, params)
+        self._last_result = await self.conn.fetch(new_sql, *args)
+    
+    def fetchone(self):
+        if self._last_result:
+            return dict(self._last_result[0])
+        return None
+        
+    def fetchall(self):
+        if self._last_result:
+            return [dict(r) for r in self._last_result]
+        return []
+
+@asynccontextmanager
+async def get_connection():
     """
-    Context manager that borrows a connection from the pool and yields a cursor.
-    Validates connection health before yielding (important for serverless DBs like Neon).
-    Automatically commits on success, rolls back on error, and returns the
-    connection to the pool regardless of outcome.
+    Async context manager that borrows a connection from the pool and yields an AsyncCursor wrapper.
+    Automatically returns the connection to the pool.
     """
     if _pool is None:
         raise RuntimeError(
             "Database pool is not initialized. "
-            "Ensure init_pool() is called at application startup."
+            "Ensure await init_pool() is called at application startup."
         )
 
-    conn = None
-    # 1. Obtain a healthy connection
-    for attempt in range(max_retries):
-        conn = _pool.getconn()
-        conn.autocommit = autocommit
-        try:
-            # Ping connection to ensure it wasn't dropped by the server
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-            break  # Healthy
-        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
-            logger.warning(f"Discarding dead DB connection (attempt {attempt + 1}/{max_retries}): {e}")
-            _pool.putconn(conn, close=True)
-            conn = None
-            if attempt == max_retries - 1:
-                raise
-
-    # 2. Yield cursor
-    try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            register_vector(conn)
-            yield cur
-            if not autocommit:
-                conn.commit()
-    except Exception:
-        if not autocommit:
-            try:
-                conn.rollback()
-            except psycopg2.InterfaceError:
-                pass # Connection already closed, nothing to rollback
-        raise
-    finally:
-        # Check if the connection broke during the transaction
-        is_broken = False
-        try:
-            if conn.closed != 0:
-                is_broken = True
-        except Exception:
-            is_broken = True
-            
-        _pool.putconn(conn, close=is_broken)
-
+    async with _pool.acquire() as conn:
+        yield AsyncCursor(conn)
 
 # ── Quick test ────────────────────────────────────────────────
 if __name__ == "__main__":
     import os
+    import asyncio
     from dotenv import load_dotenv
     load_dotenv()
 
-    print("\nTesting database connection pool...\n")
-    try:
-        init_pool()
-        with get_cursor() as cur:
-            cur.execute("SELECT version();")
-            row = cur.fetchone()
-            print(f"Connected! PostgreSQL: {row['version'][:50]}")
+    async def test():
+        print("\nTesting database connection pool...\n")
+        try:
+            await init_pool()
+            async with get_connection() as cur:
+                await cur.execute("SELECT version();")
+                version = cur.fetchone()["version"]
+                print(f"Connected! PostgreSQL: {version[:50]}")
 
-            cur.execute("SELECT extname FROM pg_extension WHERE extname = 'vector';")
-            result = cur.fetchone()
-            if result:
-                print("pgvector extension is installed.")
-            else:
-                print("WARNING: pgvector NOT found. Run schema_unified.sql first.")
-        close_pool()
-    except Exception as err:
-        print(f"Connection failed: {err}")
+                await cur.execute("SELECT extname FROM pg_extension WHERE extname = 'vector';")
+                ext = cur.fetchone()
+                if ext:
+                    print("pgvector extension is installed.")
+                else:
+                    print("WARNING: pgvector NOT found. Run schema_unified.sql first.")
+            await close_pool()
+        except Exception as err:
+            print(f"Connection failed: {err}")
+
+    asyncio.run(test())

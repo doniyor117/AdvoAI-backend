@@ -20,7 +20,7 @@ from app.database.queries import search_similar_chunks, fetch_document_parts
 logger = logging.getLogger(__name__)
 
 
-def retrieve_context(question: str, top_k: int = 5) -> Dict[str, Any]:
+async def retrieve_context(question: str, top_k: int = 5) -> Dict[str, Any]:
     """
     The complete RAG retrieval pipeline.
 
@@ -39,11 +39,11 @@ def retrieve_context(question: str, top_k: int = 5) -> Dict[str, Any]:
 
     # Step 1: Embed the query via Gemini Embedding 2
     embedder = get_embedder()
-    query_embedding = embedder.embed_query(question)
+    query_embedding = await embedder.embed_query(question)
     logger.info(f"Query embedded ({len(query_embedding)}-dim)")
 
     # Step 2: Vector search — top-K similar chunks
-    matched_chunks = search_similar_chunks(query_embedding, top_k=top_k)
+    matched_chunks = await search_similar_chunks(query_embedding, top_k=top_k)
     logger.info(f"Matched {len(matched_chunks)} chunks")
 
     if matched_chunks:
@@ -54,11 +54,12 @@ def retrieve_context(question: str, top_k: int = 5) -> Dict[str, Any]:
     logger.info(f"Fetching {len(part_ids)} unique document parts (Mega-chunks)...")
 
     # Step 4: Fetch full text of document parts
-    parent_documents = fetch_document_parts(part_ids)
+    parent_documents = await fetch_document_parts(part_ids)
 
     # Step 5: Combine all parent Markdown into one context string
     context_markdown = "\n\n---\n\n".join(
-        doc["full_markdown"] for doc in parent_documents
+        f"Document: {doc['root_title']}\nPart: {doc['title']}\n\n{doc['full_markdown']}"
+        for doc in parent_documents
     )
 
     logger.info(f"Context ready: {len(context_markdown):,} chars")

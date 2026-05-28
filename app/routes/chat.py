@@ -18,7 +18,8 @@ from app.middleware import require_rate_limit, get_current_user
 from app.database.queries import (
     get_session_by_id, update_session_summary,
     create_session, rename_session,
-    insert_message, get_session_messages, delete_oldest_message
+    insert_message, get_session_messages, delete_oldest_message,
+    log_router_analytics
 )
 
 router = APIRouter()
@@ -30,7 +31,7 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = Field(default=None, description="Chat session ID for conversation continuity.")
     top_k: int = Field(default=5, description="Number of chunks to retrieve.")
 
-def _background_history_maintenance(
+async def _background_history_maintenance(
     session_id: str,
     question: str,
     client: Any,
@@ -44,12 +45,12 @@ def _background_history_maintenance(
     try:
         # Check sliding window size
         MAX_WINDOW_MESSAGES = 6
-        current_messages = get_session_messages(session_id, limit=100)
+        current_messages = await get_session_messages(session_id, limit=100)
         
         if len(current_messages) > MAX_WINDOW_MESSAGES:
             dropped_messages = []
             while len(current_messages) > MAX_WINDOW_MESSAGES:
-                oldest = delete_oldest_message(session_id)
+                oldest = await delete_oldest_message(session_id)
                 if oldest:
                     dropped_messages.append(oldest)
                     current_messages.pop(0)
@@ -59,17 +60,17 @@ def _background_history_maintenance(
                     f"{msg['role'].capitalize()}: {msg['content']}" 
                     for msg in dropped_messages
                 )
-                new_summary = client.summarize_archive(
+                new_summary = await client.summarize_archive(
                     old_messages=dropped_text,
                     previous_summary=session_summary
                 )
-                update_session_summary(session_id, new_summary)
+                await update_session_summary(session_id, new_summary)
 
         # Auto-title on first message
         if not recent_messages:  # If it was empty before this query
             try:
-                title = client.generate_title(question)
-                rename_session(session_id, title)
+                title = await client.generate_title(question)
+                await rename_session(session_id, title)
             except Exception as te:
                 logger.warning(f"Title generation failed: {te}")
 
@@ -77,7 +78,7 @@ def _background_history_maintenance(
         logger.warning(f"History update background task failed: {se}")
 
 @router.post("/", response_model=Dict[str, Any])
-def ask_advoai(
+async def ask_advoai(
     request: ChatRequest,
     background_tasks: BackgroundTasks,
     user: dict = Depends(require_rate_limit)
@@ -88,7 +89,7 @@ def ask_advoai(
     try:
         logger.info(f"Processing chat request: {request.question[:50]}...")
 
-        client = get_llm_client()
+        client = await get_llm_client()
 
         # ── 1. Resolve session & fetch hybrid history ───────
         session = None
@@ -96,33 +97,44 @@ def ask_advoai(
         recent_messages = []
 
         if request.session_id and user:
-            session = get_session_by_id(request.session_id)
+            session = await get_session_by_id(request.session_id)
             if session and session["user_id"] != user["id"]:
                 raise HTTPException(status_code=403, detail="Access denied to this session.")
         elif user and not request.session_id:
-            session = create_session(user["id"])
+            session = await create_session(user["id"])
             logger.info(f"Auto-created session: {session['id']}")
 
         session_id = session["id"] if session else None
 
         if session_id:
             session_summary = session.get("session_summary", "")
-            recent_messages = get_session_messages(session_id, limit=5)
+            recent_messages = await get_session_messages(session_id, limit=5)
 
         # ── 2. Intent Routing ───────────────────────────────
-        routing_data = client.route_query(request.question)
+        routing_data = await client.route_query(request.question, recent_messages=recent_messages if session_id else None)
         intent = routing_data.get("intent", "legal_rag")
         search_query = routing_data.get("search_query", request.question)
+        ideal_top_k = routing_data.get("ideal_top_k", request.top_k)
         
         is_conversational = (intent == "conversational")
-        logger.info(f"Query routed as: {intent} | Optimized Search Query: {search_query}")
+        logger.info(f"Query routed as: {intent} | Optimized Search Query: {search_query} | Ideal Top-K: {ideal_top_k}")
+        
+        # Log analytics in the background to reduce response latency
+        background_tasks.add_task(
+            log_router_analytics,
+            session_id,
+            request.question,
+            intent,
+            search_query,
+            ideal_top_k
+        )
 
         # ── 3. RAG retrieval pipeline (if needed) ───────────
         rag_result = {}
         if not is_conversational:
-            rag_result = retrieve_context(
+            rag_result = await retrieve_context(
                 question=search_query,
-                top_k=request.top_k,
+                top_k=ideal_top_k,
             )
 
             # Guard: no documents found
@@ -138,7 +150,7 @@ def ask_advoai(
 
         # ── 4. Generate answer with Main LLM ────────────────
         try:
-            llm_result = client.ask(
+            llm_result = await client.ask(
                 question=request.question,
                 structured_history=recent_messages,
                 context_markdown=rag_result.get("context_markdown", ""),
@@ -156,8 +168,8 @@ def ask_advoai(
         if session_id:
             try:
                 # Save the new exchange to sliding window
-                insert_message(session_id, "user", request.question)
-                insert_message(session_id, "assistant", llm_result["answer"])
+                await insert_message(session_id, "user", request.question)
+                await insert_message(session_id, "assistant", llm_result["answer"])
 
                 # Check sliding window size and summarize in background
                 background_tasks.add_task(
@@ -177,14 +189,14 @@ def ask_advoai(
         if not is_conversational:
             seen_doc_ids = set()
             for doc in rag_result.get("parent_documents", []):
-                # doc contains 'source_doc_id', 'title', 'full_markdown'
+                # doc contains 'source_doc_id', 'title', 'root_title', 'full_markdown'
                 doc_id = doc.get("source_doc_id")
                 if doc_id in seen_doc_ids:
                     continue
                 seen_doc_ids.add(doc_id)
                 safe_citations.append({
                     "id": doc_id,
-                    "title": doc.get("title", "Untitled Document Part"),
+                    "title": doc.get("root_title", "Untitled Document"),
                     "source_url": doc.get("source_url", "#"),
                     "text": doc.get("full_markdown") or "", 
                 })

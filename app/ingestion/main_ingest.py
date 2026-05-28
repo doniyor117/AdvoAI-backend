@@ -87,7 +87,7 @@ def _split_markdown_into_parts(markdown: str, title: str, doc_uuid: str) -> List
 
 # ── Main Pipeline ─────────────────────────────────────────────
 
-def process_and_ingest_law(url: str, skip_db: bool = False) -> Optional[Dict[str, Any]]:
+async def process_and_ingest_law(url: str, skip_db: bool = False) -> Optional[Dict[str, Any]]:
     """
     End-to-end ingestion of a single Lex.uz legal document.
     """
@@ -100,7 +100,7 @@ def process_and_ingest_law(url: str, skip_db: bool = False) -> Optional[Dict[str
     logger.info(f"Source doc ID: {source_doc_id}")
 
     if source_doc_id and not skip_db:
-        if check_duplicate(source_doc_id):
+        if await check_duplicate(source_doc_id):
             logger.info(f"Document '{source_doc_id}' already exists in DB. Skipping.")
             return None
 
@@ -117,8 +117,8 @@ def process_and_ingest_law(url: str, skip_db: bool = False) -> Optional[Dict[str
     # Step 2.5: Extract structured metadata using LLM
     logger.info("Extracting metadata using LLM...")
     header_text = markdown[:2500]
-    llm_client = get_llm_client()
-    llm_metadata = llm_client.extract_document_metadata(header_text)
+    llm_client = await get_llm_client()
+    llm_metadata = await llm_client.extract_document_metadata(header_text)
     
     # Merge metadata
     metadata = {**base_metadata, **llm_metadata}
@@ -162,14 +162,14 @@ def process_and_ingest_law(url: str, skip_db: bool = False) -> Optional[Dict[str
     # Step 6: Generate embeddings
     embedder = get_embedder()
     # Note: passing doc_title helps gemini embeddings contextualize the chunk
-    all_search_chunks = embedder.embed_chunks(all_search_chunks, doc_title=doc_title)
+    all_search_chunks = await embedder.embed_chunks(all_search_chunks, doc_title=doc_title)
 
     # Step 7: Save to database
     if not skip_db:
         logger.info("Saving to database...")
-        insert_document(root_document_record)
-        insert_document_parts(document_parts)
-        insert_chunks(all_search_chunks)
+        await insert_document(root_document_record)
+        await insert_document_parts(document_parts)
+        await insert_chunks(all_search_chunks)
     else:
         logger.info("Skipping DB writes (skip_db=True)")
 

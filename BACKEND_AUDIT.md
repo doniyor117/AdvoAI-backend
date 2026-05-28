@@ -22,28 +22,32 @@ Heavy LLM operations have been successfully decoupled from the HTTP response cyc
 
 ## 2. Core Modules Review
 
+The entire backend operates on a **fully asynchronous, non-blocking architecture** designed for high concurrency and zero event-loop blocking.
+
 ### `app/database/`
-- **`connection.py`**: Properly utilizes `psycopg2.pool.ThreadedConnectionPool` configured during the FastAPI lifespan. This thread-safe implementation allows background tasks to safely query the database concurrently without exhausting connection limits.
-- **`queries.py` & `schema_unified.sql`**: Schema is idempotent. `pgvector` indexing relies on HNSW, which provides high recall and scale.
+- **`connection.py`**: Manages a global `asyncpg.Pool` initialized during the FastAPI lifespan (`@asynccontextmanager`). It uses `yield pool` so all routers can safely borrow connections. Context managers like `get_db_connection()` are used across all queries to ensure safe releasing of connections back to the pool.
+- **`queries.py` & `schema_unified.sql`**: Contains all SQL functions parameterized securely. The schema uses `pgvector` with HNSW indexes (`m = 16, ef_construction = 64`) for extremely fast, high-recall vector search. 
 
 ### `app/services/`
-- **`llm_client.py`**: The `GeminiClient` is clean and adheres to the Single Responsibility Principle. It isolates all GenAI SDK logic from the API layer.
-- **`rag_pipeline.py`**: Implements Parent-Child chunk retrieval (Mega-chunking), effectively bypassing context fragmentation issues commonly found in standard vector setups.
+- **`llm_client.py` (`GeminiClient`)**: Implements `google-genai` SDK natively via the `aio` (async) properties (`await client.aio.models.generate_content`). This isolation prevents network blocking. It includes a custom retry loop with exponential backoff using `asyncio.sleep()`.
+- **`embedder.py` (`GeminiEmbedder`)**: Similarly uses the async `aio` SDK to interface with `gemini-embedding-2`. It handles automatic dimension normalization to 1536-dim and handles `429 Too Many Requests` elegantly using an async retry loop.
+- **`rag_pipeline.py`**: The "Mega-chunking" or "Parent-Child" RAG engine. It embeds the query, searches for top matching child chunks in `pgvector`, extracts the `document_part_id`, and fetches the *full parent document markdown* (up to 4000 tokens per part) from the database to supply as context to the LLM. This solves the classic RAG fragmentation problem.
 
 ### `app/routes/`
-- **`chat.py`**: The main endpoint `/api/chat/` is highly efficient. It manages session context cleanly and correctly isolates non-essential operations to background threads. Dependency injection is used appropriately for rate limiters.
+- **`chat.py`**: The core conversational endpoint. Highly optimized. It routes query intents (`legal_rag` vs `conversational`) synchronously, delegates context retrieval, and delegates history trimming and auto-titling to `FastAPI BackgroundTasks` running safely in the async event loop.
+- **`auth.py`**: Handles user authentication via standard email/password or Google OAuth. It uses `asyncio.to_thread()` to safely wrap synchronous Google SDK token validation requests.
 
 ### `tests/`
-- **Test Coverage**: 12 comprehensive unit and integration tests written using `pytest`.
-- **Mocks**: External APIs (like the GenAI SDK) are securely mocked using `unittest.mock`, validating that the routing logic, dictionary returns, and fallback mechanisms perform perfectly under varied conditions.
+- **Test Coverage**: 13 comprehensive `pytest` cases across 4 files (`test_rag.py`, `test_ingestion.py`, `test_chat_route.py`, `test_llm_client.py`).
+- **Async Mocks**: External endpoints, database operations, and Google GenAI SDK methods are fully mocked using `unittest.mock.AsyncMock` and `@pytest.mark.asyncio`.
 
 ---
 
 ## 3. Security and Stability Assessment
 
-- **Authentication / Authorization**: Handled cleanly in `middleware.py` utilizing secure JWTs.
-- **Error Handling**: The `_generate_with_retry` function captures generic exceptions and logs effectively. 
-- **Database Thread Safety**: Since `BackgroundTasks` run in the same process via `anyio`, thread pooling is correctly managed by `psycopg2.pool.ThreadedConnectionPool`. Tests confirmed there are no connection leaks.
+- **Authentication / Authorization**: Handled cleanly in `app/middleware.py` utilizing secure JWTs attached via `HTTPOnly` cookies or Bearer headers.
+- **Event Loop Stability**: The backend strictly avoids `requests`, `urllib`, and `time.sleep()`. All external I/O uses native async interfaces or `asyncio.to_thread()` offloading, ensuring that `uvicorn` can shut down gracefully without `Address already in use` zombie processes.
+- **Database Thread Safety**: Managed perfectly via `asyncpg.Pool`. Connections are never leaked due to strict reliance on asynchronous context managers (`async with pool.acquire()`).
 
 ---
 
@@ -89,8 +93,239 @@ The application exposes the following RESTful endpoints grouped by their respect
 
 ---
 
-## 5. Future Recommendations / Next Steps
+## 5. API Response Examples
 
-1. **Async DB Drivers**: Currently, the application uses `psycopg2` (synchronous) combined with FastAPI's `def` routes, which delegates blocking calls to a thread pool. Upgrading to `asyncpg` with `SQLAlchemy 2.0` could increase throughput under extremely high concurrency.
-2. **Dynamic Top-K Expansion**: The RAG pipeline currently accepts a static `top_k`. The Router Agent could be modified to also output an "ideal `top_k`" based on the complexity of the legal query it formulates.
-3. **Analytics Logging**: Consider storing the "Optimized Search Queries" generated by Gemma 4 alongside the raw user queries in the database to allow admins to evaluate router performance over time.
+This section provides typical JSON response structures for key endpoints in the AdvoAI backend, useful for frontend integration and debugging.
+
+### Chat Endpoint
+**`POST /api/chat/`**
+```json
+{
+  "answer": "The Constitution of the Republic of Uzbekistan is the supreme law...",
+  "model_used": "gemini-3.1-flash-lite",
+  "citations": [
+    {
+      "id": "doc-uuid-1234",
+      "title": "Constitution of the Republic of Uzbekistan",
+      "source_url": "https://lex.uz/docs/...",
+      "text": "Full markdown text of the retrieved chunk..."
+    }
+  ],
+  "session_id": "session-uuid-5678",
+  "intent": "legal_rag",
+  "metadata": {
+    "context_length_chars": 12050,
+    "prompt_length_chars": 12500,
+    "chunks_used": 3,
+    "documents_used": 1
+  }
+}
+```
+
+### Auth Endpoints
+**`POST /api/auth/login` (and `/register`, `/google`)**
+```json
+{
+  "message": "Login successful.",
+  "user": {
+    "id": "user-uuid-1234",
+    "email": "user@example.com",
+    "full_name": "John Doe",
+    "role": "user",
+    "auth_provider": "email",
+    "email_verified": true
+  },
+  "token": "eyJhbGciOiJIUzI1NiIsInR5..."
+}
+```
+
+**`GET /api/auth/me`**
+```json
+{
+  "user": {
+    "id": "user-uuid-1234",
+    "email": "user@example.com",
+    "full_name": "John Doe",
+    "role": "user",
+    "auth_provider": "email",
+    "email_verified": true
+  }
+}
+```
+
+### Sessions Endpoints
+**`GET /api/sessions/`**
+```json
+{
+  "sessions": [
+    {
+      "id": "session-uuid-123",
+      "title": "Contract Dispute Inquiry",
+      "is_pinned": false,
+      "created_at": "2026-05-28T10:00:00"
+    }
+  ]
+}
+```
+
+**`GET /api/sessions/{session_id}`**
+```json
+{
+  "session": {
+    "id": "session-uuid-123",
+    "user_id": "user-uuid-1234",
+    "title": "Contract Dispute Inquiry",
+    "session_summary": "User asked about breach of contract penalties under the Civil Code.",
+    "is_pinned": false,
+    "messages": [
+      {
+        "id": "msg-uuid-1",
+        "role": "user",
+        "content": "What are the penalties for late payment?",
+        "created_at": "2026-05-28T10:05:00"
+      },
+      {
+        "id": "msg-uuid-2",
+        "role": "assistant",
+        "content": "According to the Civil Code...",
+        "created_at": "2026-05-28T10:05:05"
+      }
+    ]
+  }
+}
+```
+
+**`POST /api/sessions/`**
+```json
+{
+  "session": {
+    "id": "new-session-uuid",
+    "user_id": "user-uuid-1234",
+    "title": "New Chat",
+    "session_summary": null,
+    "is_pinned": false,
+    "created_at": "2026-05-28T12:00:00"
+  }
+}
+```
+
+### Admin Endpoints (Requires `role="admin"`)
+**`GET /api/admin/stats`**
+```json
+{
+  "stats": {
+    "total_users": 15,
+    "total_documents": 42,
+    "total_sessions": 128
+  }
+}
+```
+
+**`GET /api/admin/settings`**
+```json
+{
+  "settings": [
+    {
+      "key": "current_llm_model",
+      "value": "gemini-3.1-flash-lite"
+    }
+  ]
+}
+```
+
+**`PATCH /api/admin/settings`**
+```json
+{
+  "message": "Updated: current_llm_model",
+  "settings": [
+    {
+      "key": "current_llm_model",
+      "value": "gemini-3.1-flash-lite"
+    }
+  ]
+}
+```
+
+**`GET /api/admin/users`**
+```json
+{
+  "users": [
+    {
+      "id": "user-uuid",
+      "email": "user@example.com",
+      "role": "free",
+      "is_banned": false
+    }
+  ]
+}
+```
+
+**`PATCH /api/admin/users/{user_id}/role`**
+```json
+{
+  "message": "User role updated to 'admin'."
+}
+```
+
+**`PATCH /api/admin/users/{user_id}/ban`**
+```json
+{
+  "message": "User banned.",
+  "is_banned": true
+}
+```
+
+**`GET /api/admin/documents`**
+```json
+{
+  "documents": [
+    {
+      "id": "doc-uuid",
+      "source_doc_id": "111189",
+      "title": "Civil Code",
+      "is_active": true
+    }
+  ]
+}
+```
+
+**`GET /api/admin/documents/{doc_id}`**
+```json
+{
+  "document": {
+    "id": "doc-uuid",
+    "source_doc_id": "111189",
+    "title": "Civil Code",
+    "full_markdown": "Full text of the document..."
+  }
+}
+```
+
+**`POST /api/admin/ingest`**
+```json
+{
+  "status": "success",
+  "message": "Document ingested successfully.",
+  "data": {
+    "doc_id": "uuid",
+    "chunks_created": 50
+  }
+}
+```
+
+### Health Endpoints
+**`GET /api/health/`**
+```json
+{
+  "status": "online",
+  "message": "AdvoAI API is running"
+}
+```
+
+**`GET /api/health/db`**
+```json
+{
+  "status": "healthy",
+  "message": "Database connection successful."
+}
+```

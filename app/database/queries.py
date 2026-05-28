@@ -4,14 +4,45 @@ queries.py — Database Query Functions
 All SQL operations using parameterized queries.
 Rows returned as dicts via RealDictCursor (configured in connection.py).
 """
-
 import json
 import logging
+import re
 from typing import Dict, List, Any, Optional
 
-from app.database.connection import get_cursor
+from app.database.connection import get_connection, AsyncCursor
 
 logger = logging.getLogger(__name__)
+
+
+def _adapt_sql(sql: str, params: Any = None) -> tuple[str, list]:
+    if params is None:
+        return sql, []
+    
+    if isinstance(params, dict):
+        args = []
+        def repl(m):
+            key = m.group(1)
+            if key not in params:
+                raise KeyError(f"Missing parameter {key}")
+            args.append(params[key])
+            return f"${len(args)}"
+        new_sql = re.sub(r"%\(([^)]+)\)s", repl, sql)
+        return new_sql, args
+    elif isinstance(params, (list, tuple)):
+        args = list(params)
+        # replace %s with $1, $2, etc.
+        def repl(m):
+            if not hasattr(repl, "count"):
+                repl.count = 0
+            repl.count += 1
+            return f"${repl.count}"
+        new_sql = re.sub(r"%s", repl, sql)
+        return new_sql, args
+    else:
+        return sql, [params]
+
+
+
 
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -26,17 +57,17 @@ def _row_to_str(row: dict, *uuid_keys: str) -> dict:
 
 # ── Document Queries ──────────────────────────────────────────
 
-def check_duplicate(source_doc_id: str) -> bool:
+async def check_duplicate(source_doc_id: str) -> bool:
     """Returns True if a document with this source_doc_id already exists."""
-    with get_cursor() as cur:
-        cur.execute(
+    async with get_connection() as cur:
+        await cur.execute(
             "SELECT 1 FROM documents WHERE source_doc_id = %s LIMIT 1;",
             (source_doc_id,)
         )
         return cur.fetchone() is not None
 
 
-def insert_document(record: Dict[str, Any]) -> None:
+async def insert_document(record: Dict[str, Any]) -> None:
     """
     Inserts a parent document into the documents table.
     """
@@ -50,12 +81,12 @@ def insert_document(record: Dict[str, Any]) -> None:
             %(doc_date)s, %(source_url)s, %(is_active)s
         );
     """
-    with get_cursor() as cur:
-        cur.execute(sql, record)
+    async with get_connection() as cur:
+        await cur.execute(sql, record)
     logger.info(f"Document saved: {record['source_doc_id']} -> {record['id'][:8]}...")
 
 
-def insert_document_parts(parts: List[Dict[str, Any]]) -> None:
+async def insert_document_parts(parts: List[Dict[str, Any]]) -> None:
     """
     Inserts mega-chunks into the document_parts table.
     Expected keys: id, document_id, part_title, text, part_index
@@ -67,9 +98,9 @@ def insert_document_parts(parts: List[Dict[str, Any]]) -> None:
         INSERT INTO document_parts (id, document_id, part_title, text, part_index)
         VALUES (%(id)s, %(document_id)s, %(part_title)s, %(text)s, %(part_index)s);
     """
-    with get_cursor() as cur:
+    async with get_connection() as cur:
         for part in parts:
-            cur.execute(sql, {
+            await cur.execute(sql, {
                 "id": part["id"],
                 "document_id": part["document_id"],
                 "part_title": part["part_title"],
@@ -79,7 +110,7 @@ def insert_document_parts(parts: List[Dict[str, Any]]) -> None:
     logger.info(f"{len(parts)} document parts saved.")
 
 
-def insert_chunks(chunks: List[Dict[str, Any]]) -> None:
+async def insert_chunks(chunks: List[Dict[str, Any]]) -> None:
     """
     Batch-inserts search chunks.
     Expected keys: id, document_part_id, text, embedding, chunk_metadata
@@ -92,9 +123,9 @@ def insert_chunks(chunks: List[Dict[str, Any]]) -> None:
         INSERT INTO chunks (id, document_part_id, text, embedding, chunk_metadata)
         VALUES (%(id)s, %(document_part_id)s, %(text)s, %(embedding)s, %(chunk_metadata)s);
     """
-    with get_cursor() as cur:
+    async with get_connection() as cur:
         for chunk in chunks:
-            cur.execute(sql, {
+            await cur.execute(sql, {
                 "id": chunk["id"],
                 "document_part_id": chunk["document_part_id"],
                 "text": chunk["text"],
@@ -107,7 +138,7 @@ def insert_chunks(chunks: List[Dict[str, Any]]) -> None:
 
 # ── RAG Retrieval Queries ─────────────────────────────────────
 
-def search_similar_chunks(query_embedding: List[float], top_k: int = 5) -> List[Dict[str, Any]]:
+async def search_similar_chunks(query_embedding: List[float], top_k: int = 5) -> List[Dict[str, Any]]:
     """Finds the top-K most similar chunks to the query embedding."""
     sql = """
         SELECT
@@ -119,8 +150,8 @@ def search_similar_chunks(query_embedding: List[float], top_k: int = 5) -> List[
         ORDER BY embedding <=> %s::vector
         LIMIT %s;
     """
-    with get_cursor() as cur:
-        cur.execute(sql, (query_embedding, query_embedding, top_k))
+    async with get_connection() as cur:
+        await cur.execute(sql, (query_embedding, query_embedding, top_k))
         rows = cur.fetchall()
 
     return [
@@ -134,26 +165,27 @@ def search_similar_chunks(query_embedding: List[float], top_k: int = 5) -> List[
     ]
 
 
-def fetch_document_parts(part_ids: List[str]) -> List[Dict[str, Any]]:
+async def fetch_document_parts(part_ids: List[str]) -> List[Dict[str, Any]]:
     """Fetches full text for the given document_part UUIDs, joined with document metadata."""
     if not part_ids:
         return []
 
     sql = """
         SELECT dp.id AS part_id, dp.text AS full_markdown, dp.part_title AS title, 
-               d.source_doc_id, d.source_url
+               d.source_doc_id, d.source_url, d.title AS root_title
         FROM document_parts dp
         JOIN documents d ON dp.document_id = d.id
         WHERE dp.id = ANY(%s::uuid[]);
     """
-    with get_cursor() as cur:
-        cur.execute(sql, (part_ids,))
+    async with get_connection() as cur:
+        await cur.execute(sql, (part_ids,))
         rows = cur.fetchall()
 
     return [
         {
             "id": str(row["part_id"]),
             "title": row["title"],
+            "root_title": row["root_title"],
             "full_markdown": row["full_markdown"],
             "source_doc_id": row["source_doc_id"],
             "source_url": row["source_url"],
@@ -181,7 +213,7 @@ def _user_row(row) -> Dict[str, Any]:
     }
 
 
-def create_user(
+async def create_user(
     email: str,
     password_hash: str = None,
     full_name: str = None,
@@ -195,61 +227,61 @@ def create_user(
         RETURNING id, email, password_hash, full_name, role, auth_provider,
                   google_id, email_verified, is_active, is_banned, created_at, last_login_at;
     """
-    with get_cursor() as cur:
-        cur.execute(sql, (email, password_hash, full_name, auth_provider, google_id, email_verified))
+    async with get_connection() as cur:
+        await cur.execute(sql, (email, password_hash, full_name, auth_provider, google_id, email_verified))
         row = cur.fetchone()
     return _user_row(row) if row else None
 
 
-def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
+async def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
     sql = """
         SELECT id, email, password_hash, full_name, role, auth_provider,
                google_id, email_verified, is_active, is_banned, created_at, last_login_at
         FROM users WHERE email = %s;
     """
-    with get_cursor() as cur:
-        cur.execute(sql, (email,))
+    async with get_connection() as cur:
+        await cur.execute(sql, (email,))
         row = cur.fetchone()
     return _user_row(row) if row else None
 
 
-def get_user_by_id(user_id: str) -> Optional[Dict[str, Any]]:
+async def get_user_by_id(user_id: str) -> Optional[Dict[str, Any]]:
     sql = """
         SELECT id, email, password_hash, full_name, role, auth_provider,
                google_id, email_verified, is_active, is_banned, created_at, last_login_at
         FROM users WHERE id = %s::uuid;
     """
-    with get_cursor() as cur:
-        cur.execute(sql, (user_id,))
+    async with get_connection() as cur:
+        await cur.execute(sql, (user_id,))
         row = cur.fetchone()
     return _user_row(row) if row else None
 
 
-def get_user_by_google_id(google_id: str) -> Optional[Dict[str, Any]]:
+async def get_user_by_google_id(google_id: str) -> Optional[Dict[str, Any]]:
     sql = """
         SELECT id, email, password_hash, full_name, role, auth_provider,
                google_id, email_verified, is_active, is_banned, created_at, last_login_at
         FROM users WHERE google_id = %s;
     """
-    with get_cursor() as cur:
-        cur.execute(sql, (google_id,))
+    async with get_connection() as cur:
+        await cur.execute(sql, (google_id,))
         row = cur.fetchone()
     return _user_row(row) if row else None
 
 
-def link_google_id(user_id: str, google_id: str) -> None:
-    with get_cursor() as cur:
-        cur.execute("UPDATE users SET google_id = %s WHERE id = %s::uuid;", (google_id, user_id))
+async def link_google_id(user_id: str, google_id: str) -> None:
+    async with get_connection() as cur:
+        await cur.execute("UPDATE users SET google_id = %s WHERE id = %s::uuid;", (google_id, user_id))
 
 
-def update_last_login(user_id: str) -> None:
-    with get_cursor() as cur:
-        cur.execute("UPDATE users SET last_login_at = NOW() WHERE id = %s::uuid;", (user_id,))
+async def update_last_login(user_id: str) -> None:
+    async with get_connection() as cur:
+        await cur.execute("UPDATE users SET last_login_at = NOW() WHERE id = %s::uuid;", (user_id,))
 
 
-def update_user_profile(user_id: str, full_name: str) -> None:
-    with get_cursor() as cur:
-        cur.execute("UPDATE users SET full_name = %s WHERE id = %s::uuid;", (full_name, user_id))
+async def update_user_profile(user_id: str, full_name: str) -> None:
+    async with get_connection() as cur:
+        await cur.execute("UPDATE users SET full_name = %s WHERE id = %s::uuid;", (full_name, user_id))
 
 
 # ── Chat Session & Messages Queries ─────────────────────────
@@ -266,81 +298,81 @@ def _session_row(row) -> Dict[str, Any]:
     }
 
 
-def create_session(user_id: str, title: str = "New Chat") -> Optional[Dict[str, Any]]:
+async def create_session(user_id: str, title: str = "New Chat") -> Optional[Dict[str, Any]]:
     sql = """
         INSERT INTO chat_sessions (user_id, title)
         VALUES (%s::uuid, %s)
         RETURNING id, user_id, title, session_summary, is_pinned, created_at, updated_at;
     """
-    with get_cursor() as cur:
-        cur.execute(sql, (user_id, title))
+    async with get_connection() as cur:
+        await cur.execute(sql, (user_id, title))
         row = cur.fetchone()
     return _session_row(row) if row else None
 
 
-def get_user_sessions(user_id: str) -> List[Dict[str, Any]]:
+async def get_user_sessions(user_id: str) -> List[Dict[str, Any]]:
     sql = """
         SELECT id, user_id, title, session_summary, is_pinned, created_at, updated_at
         FROM chat_sessions
         WHERE user_id = %s::uuid
         ORDER BY is_pinned DESC, updated_at DESC;
     """
-    with get_cursor() as cur:
-        cur.execute(sql, (user_id,))
+    async with get_connection() as cur:
+        await cur.execute(sql, (user_id,))
         rows = cur.fetchall()
     return [_session_row(r) for r in rows]
 
 
-def get_session_by_id(session_id: str) -> Optional[Dict[str, Any]]:
+async def get_session_by_id(session_id: str) -> Optional[Dict[str, Any]]:
     sql = """
         SELECT id, user_id, title, session_summary, is_pinned, created_at, updated_at
         FROM chat_sessions WHERE id = %s::uuid;
     """
-    with get_cursor() as cur:
-        cur.execute(sql, (session_id,))
+    async with get_connection() as cur:
+        await cur.execute(sql, (session_id,))
         row = cur.fetchone()
     return _session_row(row) if row else None
 
 
-def update_session_summary(session_id: str, summary: str) -> None:
+async def update_session_summary(session_id: str, summary: str) -> None:
     sql = "UPDATE chat_sessions SET session_summary = %s, updated_at = NOW() WHERE id = %s::uuid;"
-    with get_cursor() as cur:
-        cur.execute(sql, (summary, session_id))
+    async with get_connection() as cur:
+        await cur.execute(sql, (summary, session_id))
 
 
-def rename_session(session_id: str, title: str) -> None:
-    with get_cursor() as cur:
-        cur.execute(
+async def rename_session(session_id: str, title: str) -> None:
+    async with get_connection() as cur:
+        await cur.execute(
             "UPDATE chat_sessions SET title = %s, updated_at = NOW() WHERE id = %s::uuid;",
             (title, session_id)
         )
 
 
-def toggle_pin_session(session_id: str) -> None:
-    with get_cursor() as cur:
-        cur.execute(
+async def toggle_pin_session(session_id: str) -> None:
+    async with get_connection() as cur:
+        await cur.execute(
             "UPDATE chat_sessions SET is_pinned = NOT is_pinned, updated_at = NOW() WHERE id = %s::uuid;",
             (session_id,)
         )
 
 
-def delete_session(session_id: str) -> None:
-    with get_cursor() as cur:
-        cur.execute("DELETE FROM chat_sessions WHERE id = %s::uuid;", (session_id,))
+async def delete_session(session_id: str) -> None:
+    async with get_connection() as cur:
+        await cur.execute("DELETE FROM chat_sessions WHERE id = %s::uuid;", (session_id,))
 
 
-def insert_message(session_id: str, role: str, content: str) -> None:
+async def insert_message(session_id: str, role: str, content: str) -> None:
     sql = """
         INSERT INTO chat_messages (session_id, role, content)
         VALUES (%s::uuid, %s, %s);
     """
-    with get_cursor() as cur:
-        cur.execute(sql, (session_id, role, content))
+    async with get_connection() as cur:
+        await cur.execute(sql, (session_id, role, content))
         # Also touch the session
-        cur.execute("UPDATE chat_sessions SET updated_at = NOW() WHERE id = %s::uuid;", (session_id,))
+        await cur.execute("UPDATE chat_sessions SET updated_at = NOW() WHERE id = %s::uuid;", (session_id,))
 
 
-def get_session_messages(session_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+async def get_session_messages(session_id: str, limit: int = 10) -> List[Dict[str, Any]]:
     """Fetches the last N messages for a session, ordered chronologically."""
     sql = """
         SELECT id, role, content, created_at
@@ -349,8 +381,8 @@ def get_session_messages(session_id: str, limit: int = 10) -> List[Dict[str, Any
         ORDER BY created_at DESC
         LIMIT %s;
     """
-    with get_cursor() as cur:
-        cur.execute(sql, (session_id, limit))
+    async with get_connection() as cur:
+        await cur.execute(sql, (session_id, limit))
         rows = cur.fetchall()
     
     # Reverse to return in chronological order
@@ -365,7 +397,7 @@ def get_session_messages(session_id: str, limit: int = 10) -> List[Dict[str, Any
     return result
 
 
-def delete_oldest_message(session_id: str) -> Optional[Dict[str, Any]]:
+async def delete_oldest_message(session_id: str) -> Optional[Dict[str, Any]]:
     """Deletes and returns the oldest message in the session, useful for archiving shift."""
     sql = """
         DELETE FROM chat_messages 
@@ -377,8 +409,8 @@ def delete_oldest_message(session_id: str) -> Optional[Dict[str, Any]]:
         )
         RETURNING id, role, content, created_at;
     """
-    with get_cursor() as cur:
-        cur.execute(sql, (session_id,))
+    async with get_connection() as cur:
+        await cur.execute(sql, (session_id,))
         row = cur.fetchone()
     
     if row:
@@ -392,9 +424,9 @@ def delete_oldest_message(session_id: str) -> Optional[Dict[str, Any]]:
 
 # ── Usage Tracking Queries ────────────────────────────────────
 
-def get_daily_usage(user_id: str) -> int:
-    with get_cursor() as cur:
-        cur.execute(
+async def get_daily_usage(user_id: str) -> int:
+    async with get_connection() as cur:
+        await cur.execute(
             "SELECT message_count FROM usage_logs WHERE user_id = %s::uuid AND usage_date = CURRENT_DATE;",
             (user_id,)
         )
@@ -402,7 +434,7 @@ def get_daily_usage(user_id: str) -> int:
     return row["message_count"] if row else 0
 
 
-def increment_usage(user_id: str) -> int:
+async def increment_usage(user_id: str) -> int:
     sql = """
         INSERT INTO usage_logs (user_id, usage_date, message_count)
         VALUES (%s::uuid, CURRENT_DATE, 1)
@@ -410,20 +442,20 @@ def increment_usage(user_id: str) -> int:
         DO UPDATE SET message_count = usage_logs.message_count + 1
         RETURNING message_count;
     """
-    with get_cursor() as cur:
-        cur.execute(sql, (user_id,))
+    async with get_connection() as cur:
+        await cur.execute(sql, (user_id,))
         row = cur.fetchone()
     return row["message_count"] if row else 1
 
 
-def get_guest_usage(fingerprint: str) -> int:
-    with get_cursor() as cur:
-        cur.execute("SELECT message_count FROM guest_usage WHERE fingerprint = %s;", (fingerprint,))
+async def get_guest_usage(fingerprint: str) -> int:
+    async with get_connection() as cur:
+        await cur.execute("SELECT message_count FROM guest_usage WHERE fingerprint = %s;", (fingerprint,))
         row = cur.fetchone()
     return row["message_count"] if row else 0
 
 
-def increment_guest_usage(fingerprint: str) -> int:
+async def increment_guest_usage(fingerprint: str) -> int:
     sql = """
         INSERT INTO guest_usage (fingerprint, message_count)
         VALUES (%s, 1)
@@ -432,15 +464,15 @@ def increment_guest_usage(fingerprint: str) -> int:
                       last_seen_at = NOW()
         RETURNING message_count;
     """
-    with get_cursor() as cur:
-        cur.execute(sql, (fingerprint,))
+    async with get_connection() as cur:
+        await cur.execute(sql, (fingerprint,))
         row = cur.fetchone()
     return row["message_count"] if row else 1
 
 
 # ── Admin Queries ─────────────────────────────────────────────
 
-def get_all_users() -> List[Dict[str, Any]]:
+async def get_all_users() -> List[Dict[str, Any]]:
     sql = """
         SELECT u.id, u.email, u.full_name, u.role, u.auth_provider,
                u.email_verified, u.is_active, u.created_at, u.last_login_at,
@@ -450,8 +482,8 @@ def get_all_users() -> List[Dict[str, Any]]:
         LEFT JOIN usage_logs ul ON u.id = ul.user_id AND ul.usage_date = CURRENT_DATE
         ORDER BY u.created_at DESC;
     """
-    with get_cursor() as cur:
-        cur.execute(sql)
+    async with get_connection() as cur:
+        await cur.execute(sql)
         rows = cur.fetchall()
 
     return [
@@ -466,14 +498,14 @@ def get_all_users() -> List[Dict[str, Any]]:
     ]
 
 
-def update_user_role(user_id: str, role: str) -> None:
+async def update_user_role(user_id: str, role: str) -> None:
     if role not in ("guest", "free", "admin"):
         raise ValueError(f"Invalid role: {role}")
-    with get_cursor() as cur:
-        cur.execute("UPDATE users SET role = %s WHERE id = %s::uuid;", (role, user_id))
+    async with get_connection() as cur:
+        await cur.execute("UPDATE users SET role = %s WHERE id = %s::uuid;", (role, user_id))
 
 
-def get_admin_stats() -> Dict[str, Any]:
+async def get_admin_stats() -> Dict[str, Any]:
     sql = """
         WITH
             user_count     AS (SELECT COUNT(*) AS n FROM users),
@@ -488,8 +520,8 @@ def get_admin_stats() -> Dict[str, Any]:
             (SELECT n FROM dau)          AS daily_active_users,
             (SELECT n FROM daily_msgs)   AS daily_messages;
     """
-    with get_cursor() as cur:
-        cur.execute(sql)
+    async with get_connection() as cur:
+        await cur.execute(sql)
         row = cur.fetchone()
 
     return {
@@ -501,7 +533,7 @@ def get_admin_stats() -> Dict[str, Any]:
     }
 
 
-def get_all_documents_admin() -> List[Dict[str, Any]]:
+async def get_all_documents_admin() -> List[Dict[str, Any]]:
     sql = """
         SELECT d.id, d.source_doc_id, d.title, d.act_type, d.doc_date,
                d.source_url, d.is_active, d.created_at,
@@ -512,8 +544,8 @@ def get_all_documents_admin() -> List[Dict[str, Any]]:
         GROUP BY d.id
         ORDER BY d.created_at DESC;
     """
-    with get_cursor() as cur:
-        cur.execute(sql)
+    async with get_connection() as cur:
+        await cur.execute(sql)
         rows = cur.fetchall()
 
     return [
@@ -530,32 +562,32 @@ def get_all_documents_admin() -> List[Dict[str, Any]]:
 
 # ── System Settings Queries ──────────────────────────────────
 
-def get_all_settings() -> Dict[str, str]:
-    with get_cursor() as cur:
-        cur.execute("SELECT key, value FROM system_settings;")
+async def get_all_settings() -> Dict[str, str]:
+    async with get_connection() as cur:
+        await cur.execute("SELECT key, value FROM system_settings;")
         rows = cur.fetchall()
     return {r["key"]: r["value"] for r in rows}
 
 
-def get_setting(key: str) -> Optional[str]:
-    with get_cursor() as cur:
-        cur.execute("SELECT value FROM system_settings WHERE key = %s;", (key,))
+async def get_setting(key: str) -> Optional[str]:
+    async with get_connection() as cur:
+        await cur.execute("SELECT value FROM system_settings WHERE key = %s;", (key,))
         row = cur.fetchone()
     return row["value"] if row else None
 
 
-def update_setting(key: str, value: str) -> None:
+async def update_setting(key: str, value: str) -> None:
     sql = """
         INSERT INTO system_settings (key, value) VALUES (%s, %s)
         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
     """
-    with get_cursor() as cur:
-        cur.execute(sql, (key, value))
+    async with get_connection() as cur:
+        await cur.execute(sql, (key, value))
 
 
 # ── Document Management Queries (Admin) ──────────────────────
 
-def get_document_full(doc_id: str) -> Optional[Dict[str, Any]]:
+async def get_document_full(doc_id: str) -> Optional[Dict[str, Any]]:
     """Fetches a document and its parts count."""
     sql = """
         SELECT d.id, d.source_doc_id, d.title, d.act_type, d.doc_date,
@@ -566,8 +598,8 @@ def get_document_full(doc_id: str) -> Optional[Dict[str, Any]]:
         WHERE d.id = %s::uuid
         GROUP BY d.id;
     """
-    with get_cursor() as cur:
-        cur.execute(sql, (doc_id,))
+    async with get_connection() as cur:
+        await cur.execute(sql, (doc_id,))
         row = cur.fetchone()
 
     if not row:
@@ -582,31 +614,31 @@ def get_document_full(doc_id: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def update_document_title(doc_id: str, title: str) -> None:
-    with get_cursor() as cur:
-        cur.execute("UPDATE documents SET title = %s WHERE id = %s::uuid;", (title, doc_id))
+async def update_document_title(doc_id: str, title: str) -> None:
+    async with get_connection() as cur:
+        await cur.execute("UPDATE documents SET title = %s WHERE id = %s::uuid;", (title, doc_id))
 
 
-def delete_document(doc_id: str) -> None:
-    with get_cursor() as cur:
-        cur.execute("DELETE FROM documents WHERE id = %s::uuid;", (doc_id,))
+async def delete_document(doc_id: str) -> None:
+    async with get_connection() as cur:
+        await cur.execute("DELETE FROM documents WHERE id = %s::uuid;", (doc_id,))
 
 
 # ── User Moderation Queries ──────────────────────────────────
 
-def toggle_ban_user(user_id: str) -> bool:
+async def toggle_ban_user(user_id: str) -> bool:
     sql = """
         UPDATE users SET is_banned = NOT COALESCE(is_banned, FALSE)
         WHERE id = %s::uuid
         RETURNING is_banned;
     """
-    with get_cursor() as cur:
-        cur.execute(sql, (user_id,))
+    async with get_connection() as cur:
+        await cur.execute(sql, (user_id,))
         row = cur.fetchone()
     return row["is_banned"] if row else False
 
 
-def get_user_stats(user_id: str) -> Dict[str, Any]:
+async def get_user_stats(user_id: str) -> Dict[str, Any]:
     sql = """
         WITH
             daily   AS (SELECT COALESCE(SUM(message_count), 0) AS n FROM usage_logs
@@ -622,8 +654,8 @@ def get_user_stats(user_id: str) -> Dict[str, Any]:
             (SELECT n FROM total)    AS total_messages,
             (SELECT n FROM sessions) AS session_count;
     """
-    with get_cursor() as cur:
-        cur.execute(sql, (user_id, user_id, user_id, user_id))
+    async with get_connection() as cur:
+        await cur.execute(sql, (user_id, user_id, user_id, user_id))
         row = cur.fetchone()
 
     return {
@@ -632,3 +664,14 @@ def get_user_stats(user_id: str) -> Dict[str, Any]:
         "total_messages": row["total_messages"],
         "session_count": row["session_count"],
     }
+
+async def log_router_analytics(session_id: Optional[str], raw_query: str, intent: str, optimized_query: str, ideal_top_k: int) -> None:
+    if not session_id:
+        return
+    sql = """
+        INSERT INTO router_analytics (session_id, raw_query, intent, optimized_query, ideal_top_k)
+        VALUES (%s::uuid, %s, %s, %s, %s)
+    """
+    async with get_connection() as cur:
+        await cur.execute(sql, (session_id, raw_query, intent, optimized_query, ideal_top_k))
+

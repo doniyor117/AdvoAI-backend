@@ -6,7 +6,7 @@ Uses JWT tokens stored in HTTP-only cookies.
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter, HTTPException, Response, Request
 from pydantic import BaseModel, EmailStr, Field

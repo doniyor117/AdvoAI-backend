@@ -36,6 +36,7 @@ class IngestRequest(BaseModel):
 
 class UpdateSettingsRequest(BaseModel):
     current_llm_model: Optional[str] = None
+    current_router_model: Optional[str] = None
     guest_message_limit: Optional[int] = None
     free_daily_limit: Optional[int] = None
 
@@ -69,6 +70,9 @@ async def update_settings(request: UpdateSettingsRequest, user=Depends(require_a
     if request.current_llm_model is not None:
         await update_setting("current_llm_model", request.current_llm_model)
         updated.append("current_llm_model")
+    if request.current_router_model is not None:
+        await update_setting("current_router_model", request.current_router_model)
+        updated.append("current_router_model")
     if request.guest_message_limit is not None:
         await update_setting("guest_message_limit", str(request.guest_message_limit))
         updated.append("guest_message_limit")

@@ -11,7 +11,7 @@ python-dotenv
 beautifulsoup4
 lxml
 requests
-markitdown
+markitdown[all]
 
 # ── Document Chunking ────────────────────────────────────────
 unstructured

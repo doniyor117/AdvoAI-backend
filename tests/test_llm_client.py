@@ -91,12 +91,21 @@ async def test_ask_method(mock_genai_client):
     # Assert structured history was mapped correctly
     contents = kwargs["contents"]
     assert len(contents) == 3 # 2 history + 1 current question
-    assert contents[0]["role"] == "user"
-    assert contents[1]["role"] == "model"
-    assert contents[2]["role"] == "user"
+    
+    # In the new code, contents is a list of types.Content objects OR dicts
+    first_role = contents[0].role if hasattr(contents[0], "role") else contents[0]["role"]
+    assert first_role == "user"
+    
+    second_role = contents[1].role if hasattr(contents[1], "role") else contents[1]["role"]
+    assert second_role == "model"
+    
+    third_role = contents[2].role if hasattr(contents[2], "role") else contents[2]["role"]
+    assert third_role == "user"
     
     # Ensure context markdown is in the final message
-    assert "Context" in contents[2]["parts"][0]["text"]
+    third_parts = contents[2].parts if hasattr(contents[2], "parts") else contents[2]["parts"]
+    third_text = third_parts[0].text if hasattr(third_parts[0], "text") else third_parts[0]["text"]
+    assert "Context" in third_text
 
 @pytest.mark.asyncio
 @patch('app.services.llm_client.genai.Client')

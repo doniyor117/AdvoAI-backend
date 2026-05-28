@@ -128,24 +128,24 @@ class GeminiClient:
         context_markdown: str = "",
         session_summary: str = "",
         is_conversational: bool = False,
+        attachments: list = None
     ) -> Dict[str, Any]:
         """
         Answers the user's question. If is_conversational=True, ignores context_markdown.
         Uses structured_history for multi-turn conversational awareness natively.
+        Supports multimodal attachments via Google GenAI File URIs.
         """
         payload = []
 
         # 1. Map prior history turns to Native Gemini Content objects
         if structured_history:
             for msg in structured_history:
-                # Map our DB roles ('user', 'assistant') to Gemini roles ('user', 'model')
-                role = "model" if msg.get("role") == "assistant" else "user"
-                content_text = msg.get("content", "")
-                payload.append(
-                    {"role": role, "parts": [{"text": content_text}]}
-                )
+                # 'user' or 'assistant' -> 'user' or 'model' for Gemini
+                role = "user" if msg["role"] == "user" else "model"
+                payload.append(types.Content(role=role, parts=[types.Part.from_text(text=msg["content"])]))
 
-        # 2. Inject Context into the Current (Final) User Turn
+        # 2. Build current turn (Context Injection)
+        final_prompt = ""
         if is_conversational:
             if session_summary:
                 final_prompt = CONVERSATIONAL_PROMPT_TEMPLATE.format(
@@ -167,11 +167,23 @@ class GeminiClient:
                     question=question,
                 )
 
-        # Append user question to payload
-        payload.append({
-            "role": "user",
-            "parts": [{"text": final_prompt}]
-        })
+        # 3. Create the parts for the current user turn
+        current_turn_parts = []
+        
+        # Add any file attachments first
+        if attachments:
+            final_prompt += f"\n\n[System Note: The user has attached {len(attachments)} file(s) to this message. Please analyze the provided file(s) to answer their question.]"
+            for file in attachments:
+                uri = file.uri if hasattr(file, 'uri') else file.get('uri')
+                mime_type = file.mime_type if hasattr(file, 'mime_type') else file.get('mime_type')
+                if uri and mime_type:
+                    current_turn_parts.append(types.Part.from_uri(file_uri=uri, mime_type=mime_type))
+                    
+        # Add the text prompt
+        current_turn_parts.append(types.Part.from_text(text=final_prompt))
+
+        # Append current user turn
+        payload.append(types.Content(role="user", parts=current_turn_parts))
         
         logger.info(f"📤 Sending structured array ({len(payload)} messages) to Main LLM...")
         
@@ -293,7 +305,7 @@ async def get_llm_client() -> GeminiClient:
     from app.database.queries import get_setting
     # Allow fallback if setting doesn't exist
     main_model = await get_setting("current_llm_model") or "gemini-3.1-flash-lite"
-    router_model = "gemma-4-31b-it" # Hardcoded specialized router
+    router_model = await get_setting("current_router_model") or "gemma-4-31b-it"
     
     _llm_client_instance = GeminiClient(main_model=main_model, router_model=router_model)
     return _llm_client_instance

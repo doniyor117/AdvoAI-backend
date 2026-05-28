@@ -46,9 +46,6 @@ async def check_rate_limit(
     Raises 429 if limit exceeded.
     Raises 403 if user is banned.
     """
-    if user and user.get("role") == "admin":
-        return user  # Admins have no limits
-
     if user:
         if user.get("is_banned"):
             raise HTTPException(
@@ -56,10 +53,14 @@ async def check_rate_limit(
                 detail="Your account has been suspended. Please contact support."
             )
 
-        free_daily_limit = await _get_dynamic_limit("free_daily_limit", settings.FREE_DAILY_LIMIT)
-
         # Atomic increment — get new count after insert/update
         new_count = await increment_usage(user["id"])
+
+        # If user is admin, they have no limits, so just return
+        if user.get("role") == "admin":
+            return user
+
+        free_daily_limit = await _get_dynamic_limit("free_daily_limit", settings.FREE_DAILY_LIMIT)
 
         # Check after incrementing: if the new count exceeds limit, reject
         if new_count > free_daily_limit:
@@ -86,7 +87,7 @@ async def check_rate_limit(
             detail="Invalid fingerprint format."
         )
 
-    guest_limit = _get_dynamic_limit("guest_message_limit", settings.GUEST_MESSAGE_LIMIT)
+    guest_limit = await _get_dynamic_limit("guest_message_limit", settings.GUEST_MESSAGE_LIMIT)
 
     # Atomic increment — get new count after insert/update
     new_count = await increment_guest_usage(fingerprint)

@@ -69,7 +69,8 @@ The application exposes the following RESTful endpoints grouped by their respect
 - `PATCH /api/auth/me`: Allows a user to update their profile information.
 
 ### Chat (`/api/chat`)
-- `POST /api/chat/`: The core Agentic RAG chat endpoint. Accepts a JSON payload containing the user's `question` and an optional `session_id`. Automatically routes the query, retrieves context, and responds. Rate-limited and utilizes background tasks for history compression.
+- `POST /api/chat/`: The core Agentic RAG chat endpoint. Accepts a JSON payload containing the user's `question`, an optional `session_id`, and `attachments`. Automatically routes the query, retrieves context, and responds. Rate-limited and utilizes background tasks for history compression.
+- `POST /api/chat/upload`: Handles `multipart/form-data` uploads. Enforces a 50MB file size limit. It asynchronously offloads disk I/O to a background thread to prevent blocking, and streams the file securely to Google's GenAI servers via the File API. Returns a `URI` used for multimodal analysis.
 
 ### Sessions (`/api/sessions`)
 - `GET /api/sessions/`: Lists all chat sessions belonging to the authenticated user.

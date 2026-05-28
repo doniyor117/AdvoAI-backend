@@ -22,8 +22,8 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 # Constants for Dynamic Mega-Chunking
-MAX_PART_SIZE = 100_000
-TARGET_SPLIT_SIZE = 60_000
+MAX_PART_SIZE = 50_000
+TARGET_SPLIT_SIZE = 20_000
 
 # ── Helpers ───────────────────────────────────────────────────
 

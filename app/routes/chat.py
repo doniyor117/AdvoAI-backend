@@ -7,13 +7,21 @@ and returns the grounded answer.
 """
 
 import logging
-from typing import Optional, Dict, Any
+import os
+import tempfile
+import asyncio
+from typing import Optional, Dict, Any, List
 
-from fastapi import APIRouter, HTTPException, Depends, Request, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Depends, Request, BackgroundTasks, UploadFile, File
 from pydantic import BaseModel, Field
 
 from app.services.rag_pipeline import retrieve_context
 from app.services.llm_client import get_llm_client
+from app.services.converter import (
+    CONVERTIBLE_MIME_TYPES,
+    convert_to_markdown,
+    save_markdown_as_tempfile,
+)
 from app.middleware import require_rate_limit, get_current_user
 from app.database.queries import (
     get_session_by_id, update_session_summary,
@@ -25,11 +33,75 @@ from app.database.queries import (
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+# Supported MIME types for file upload
+# Grouped by category for clarity
+SUPPORTED_MIME_TYPES = {
+    # ── Legal documents (text-based, converted via MarkItDown if needed) ─────
+    "application/pdf",
+    "text/plain",
+    "text/markdown",
+    "text/csv",
+    "text/html",                                                                # → converted to MD
+    "application/msword",                                                       # .doc → converted to MD
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # .docx → converted to MD
+    "application/rtf",                                                          # .rtf → converted to MD
+    "text/rtf",                                                                 # .rtf (alt MIME)
+    # ── Images (evidence, scans, screenshots) ───────────────────────────────
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+}
+
+# Human-readable labels for error messages
+_MIME_LABELS = {
+    "application/pdf": "PDF",
+    "text/plain": "plain text (.txt)",
+    "text/markdown": "Markdown (.md)",
+    "text/csv": "CSV",
+    "text/html": "HTML",
+    "application/msword": "Word document (.doc)",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "Word document (.docx)",
+    "application/rtf": "RTF",
+    "text/rtf": "RTF",
+    "image/png": "PNG image",
+    "image/jpeg": "JPEG image",
+    "image/webp": "WebP image",
+    "image/gif": "GIF image",
+}
+
+# Helpful suggestions for common rejected types
+_REJECTION_HINTS = {
+    "video/": "Videos are not supported. Please describe what you need help with instead.",
+    "audio/": "Audio files are not supported.",
+    "application/vnd.ms-excel": "Excel files are not supported. Please export your spreadsheet as CSV.",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml": "Excel files are not supported. Please export as CSV.",
+    "application/vnd.ms-powerpoint": "PowerPoint files are not supported. Please export as PDF.",
+    "application/vnd.openxmlformats-officedocument.presentationml": "PowerPoint files are not supported. Please export as PDF.",
+    "application/zip": "ZIP archives are not supported. Please upload individual files.",
+    "application/x-rar": "RAR archives are not supported. Please upload individual files.",
+    "application/octet-stream": "Binary files are not supported. Please convert to a supported format (PDF, DOCX, TXT).",
+}
+
+def _get_rejection_hint(mime: str) -> str:
+    """Returns a helpful error message for a rejected MIME type."""
+    for prefix, hint in _REJECTION_HINTS.items():
+        if mime.startswith(prefix) or mime == prefix:
+            return hint
+    return f"File type '{mime}' is not supported. Accepted types: PDF, DOCX, DOC, TXT, MD, CSV, RTF, HTML, and images (PNG, JPEG, WebP, GIF)."
+
+
+class FileAttachment(BaseModel):
+    uri: str = Field(..., description="Google GenAI File URI")
+    mime_type: str = Field(..., description="MIME type of the file")
+    name: str = Field(..., description="Internal Google name for the file")
+    display_name: str = Field(..., description="Original filename")
 
 class ChatRequest(BaseModel):
-    question: str = Field(..., min_length=2, description="The legal question to ask AdvoAI.")
+    question: str = Field(default="", description="The legal question to ask AdvoAI.")
     session_id: Optional[str] = Field(default=None, description="Chat session ID for conversation continuity.")
     top_k: int = Field(default=5, description="Number of chunks to retrieve.")
+    attachments: Optional[List[FileAttachment]] = Field(default=None, description="Optional list of attached files.")
 
 async def _background_history_maintenance(
     session_id: str,
@@ -77,6 +149,124 @@ async def _background_history_maintenance(
     except Exception as se:
         logger.warning(f"History update background task failed: {se}")
 
+@router.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    user: dict = Depends(require_rate_limit)
+):
+    """
+    Uploads a file to Google GenAI for multimodal analysis.
+
+    Pipeline:
+      1. Validate MIME type against curated whitelist
+      2. Enforce 10MB size limit
+      3. For convertible types (HTML, DOC, DOCX, RTF, CSV): convert to clean Markdown via MarkItDown
+      4. Upload final file (original or converted .md) to Gemini Files API
+      5. Wait for ACTIVE state (required for documents)
+      6. Return URI, MIME type, and display name to frontend
+    """
+    MAX_FILE_SIZE_MB = 10
+    MAX_FILE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+
+    original_tmp_path: Optional[str] = None
+    converted_tmp_path: Optional[str] = None
+
+    try:
+        client = await get_llm_client()
+
+        # ── 1. Validate MIME type ────────────────────────────
+        content_type = file.content_type or ""
+        base_mime = content_type.split(";")[0].strip().lower()
+
+        if base_mime not in SUPPORTED_MIME_TYPES:
+            raise HTTPException(
+                status_code=415,
+                detail=_get_rejection_hint(base_mime)
+            )
+
+        # ── 2. Read and validate size ────────────────────────
+        content = await file.read()
+        if len(content) > MAX_FILE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large ({len(content) // (1024*1024)}MB). Maximum allowed size is {MAX_FILE_SIZE_MB}MB."
+            )
+
+        display_name = file.filename or "uploaded_file"
+        logger.info(f"Processing upload: '{display_name}' ({base_mime}, {len(content):,} bytes)")
+
+        # ── 3. Save original to temp file ───────────────────
+        def _save(data: bytes, suffix: str) -> str:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(data)
+                return tmp.name
+
+        ext = os.path.splitext(display_name)[1] or ".bin"
+        original_tmp_path = await asyncio.to_thread(_save, content, ext)
+
+        # ── 4. Convert if needed (MarkItDown) ───────────────
+        upload_path = original_tmp_path
+        upload_mime = base_mime
+        upload_display_name = display_name
+
+        if base_mime in CONVERTIBLE_MIME_TYPES:
+            markdown_text = await convert_to_markdown(original_tmp_path, base_mime, display_name)
+            if markdown_text:
+                converted_tmp_path = await save_markdown_as_tempfile(markdown_text, display_name)
+                upload_path = converted_tmp_path
+                upload_mime = "text/markdown"
+                upload_display_name = os.path.splitext(display_name)[0] + ".md"
+                logger.info(f"Using converted Markdown file for upload: '{upload_display_name}'")
+
+        # ── 5. Upload to Gemini Files API ────────────────────
+        uploaded_file = await client.client.aio.files.upload(
+            file=upload_path,
+            config={
+                "display_name": upload_display_name,
+                "mime_type": upload_mime,
+            }
+        )
+
+        # ── 6. Wait for ACTIVE state ─────────────────────────
+        max_wait_seconds = 30
+        waited = 0
+        while getattr(uploaded_file, "state", None) and \
+              str(uploaded_file.state).upper() not in ("ACTIVE", "FILE_STATE_ACTIVE", "2"):
+            if waited >= max_wait_seconds:
+                logger.warning(f"File {uploaded_file.name} not ACTIVE after {max_wait_seconds}s, proceeding.")
+                break
+            await asyncio.sleep(2)
+            waited += 2
+            uploaded_file = await client.client.aio.files.get(name=uploaded_file.name)
+            logger.debug(f"File state: {uploaded_file.state} (waited {waited}s)")
+
+        logger.info(f"File ready: {uploaded_file.name} | state={getattr(uploaded_file, 'state', 'unknown')}")
+
+        return {
+            "uri": uploaded_file.uri,
+            "mime_type": uploaded_file.mime_type or upload_mime,
+            "name": uploaded_file.name,
+            "display_name": display_name,  # Always show the original filename to the user
+        }
+
+    except HTTPException:
+        raise
+    except ValueError as ve:
+        # MarkItDown conversion errors — user-friendly message
+        logger.warning(f"Conversion error for '{file.filename}': {ve}")
+        raise HTTPException(status_code=422, detail=str(ve))
+    except Exception as e:
+        logger.error(f"File upload failed: {e}")
+        raise HTTPException(status_code=500, detail=f"File upload failed: {str(e)}")
+    finally:
+        # Always clean up temp files
+        for path in [original_tmp_path, converted_tmp_path]:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+
 @router.post("/", response_model=Dict[str, Any])
 async def ask_advoai(
     request: ChatRequest,
@@ -111,7 +301,12 @@ async def ask_advoai(
             recent_messages = await get_session_messages(session_id, limit=5)
 
         # ── 2. Intent Routing ───────────────────────────────
-        routing_data = await client.route_query(request.question, recent_messages=recent_messages if session_id else None)
+        # If user attached files, let the router know in the question text
+        router_question = request.question
+        if request.attachments:
+            router_question += f" [User attached {len(request.attachments)} file(s)]"
+
+        routing_data = await client.route_query(router_question, recent_messages=recent_messages if session_id else None)
         intent = routing_data.get("intent", "legal_rag")
         search_query = routing_data.get("search_query", request.question)
         ideal_top_k = routing_data.get("ideal_top_k", request.top_k)
@@ -131,22 +326,45 @@ async def ask_advoai(
 
         # ── 3. RAG retrieval pipeline (if needed) ───────────
         rag_result = {}
-        if not is_conversational:
-            rag_result = await retrieve_context(
-                question=search_query,
-                top_k=ideal_top_k,
-            )
-
-            # Guard: no documents found
-            if not rag_result.get("parent_documents"):
-                return {
-                    "answer": "I couldn't find any relevant legal documents in my database to answer this question. Please try rephrasing or asking about a different topic.",
-                    "sources": [],
-                    "citations": [],
-                    "session_id": session_id,
-                    "chunks_used": 0,
-                    "intent": intent,
+        if intent == "create_contract":
+            from app.services.templates import get_template
+            contract_type = routing_data.get("contract_type", "")
+            template_text = get_template(contract_type)
+            rag_result = {
+                "context_markdown": f"## RECOMMENDED TEMPLATE FOR DRAFTING\n{template_text}\n\nNote to AI: Use this template as a starting point. Adjust it based on the user's specific details or requests.",
+                "parent_documents": [{"title": "Contract Templates", "source_url": "internal"}]
+            }
+        elif intent == "compare_contracts":
+            # For comparison, we rely entirely on the attachments provided by the user.
+            rag_result = {
+                "context_markdown": "Note to AI: The user wants to compare the attached documents. Focus entirely on analyzing the attachments.",
+                "parent_documents": [{"title": "User Attachments", "source_url": "user"}]
+            }
+        elif not is_conversational:
+            # If user has attached files, skip RAG injection entirely.
+            # The attachment IS the context — combining both risks token overflow.
+            if request.attachments:
+                logger.info("Attachments present — skipping RAG retrieval to avoid token overflow.")
+                rag_result = {
+                    "context_markdown": "",
+                    "parent_documents": [],
                 }
+            else:
+                rag_result = await retrieve_context(
+                    question=search_query,
+                    top_k=ideal_top_k,
+                )
+
+                # Guard: no documents found
+                if not rag_result.get("parent_documents"):
+                    return {
+                        "answer": "I couldn't find any relevant legal documents in my database to answer this question. Please try rephrasing or asking about a different topic.",
+                        "sources": [],
+                        "citations": [],
+                        "session_id": session_id,
+                        "chunks_used": 0,
+                        "intent": intent,
+                    }
 
         # ── 4. Generate answer with Main LLM ────────────────
         try:
@@ -156,6 +374,7 @@ async def ask_advoai(
                 context_markdown=rag_result.get("context_markdown", ""),
                 session_summary=session_summary,
                 is_conversational=is_conversational,
+                attachments=request.attachments
             )
         except (OSError, ConnectionError) as net_err:
             logger.error(f"LLM network error (DNS/connection): {net_err}")
@@ -163,6 +382,14 @@ async def ask_advoai(
                 status_code=503,
                 detail="Unable to reach the AI service. Please check your internet connection and try again."
             )
+        except Exception as llm_err:
+            err_str = str(llm_err)
+            if "token count exceeds" in err_str or "INVALID_ARGUMENT" in err_str:
+                raise HTTPException(
+                    status_code=413,
+                    detail="The attached file is too large for the AI to process in a single request. Please try a smaller file or ask about a specific section of the document."
+                )
+            raise
 
         # ── 5. Update Hybrid History (Archive Shift) ────────
         if session_id:

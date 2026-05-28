@@ -588,11 +588,12 @@ async def update_setting(key: str, value: str) -> None:
 # ── Document Management Queries (Admin) ──────────────────────
 
 async def get_document_full(doc_id: str) -> Optional[Dict[str, Any]]:
-    """Fetches a document and its parts count."""
+    """Fetches a document, its parts count, and its full markdown content."""
     sql = """
         SELECT d.id, d.source_doc_id, d.title, d.act_type, d.doc_date,
                d.source_url, d.is_active, d.created_at,
-               COUNT(dp.id) AS parts_count
+               COUNT(dp.id) AS parts_count,
+               STRING_AGG(dp.text, E'\\n\\n' ORDER BY dp.part_index) AS full_markdown
         FROM documents d
         LEFT JOIN document_parts dp ON d.id = dp.document_id
         WHERE d.id = %s::uuid
@@ -610,7 +611,7 @@ async def get_document_full(doc_id: str) -> Optional[Dict[str, Any]]:
         "title": row["title"], "act_type": row["act_type"],
         "doc_date": row["doc_date"], "source_url": row["source_url"],
         "is_active": row["is_active"], "parts_count": row["parts_count"],
-        "created_at": row["created_at"],
+        "created_at": row["created_at"], "full_markdown": row["full_markdown"] or "",
     }
 
 

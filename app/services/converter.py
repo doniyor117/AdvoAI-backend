@@ -22,6 +22,7 @@ import logging
 import asyncio
 import tempfile
 import os
+import httpx
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -85,6 +86,42 @@ async def convert_to_markdown(file_path: str, mime_type: str, display_name: str 
             f"The file may be corrupted, password-protected, or in an unsupported sub-format. "
             f"Please try saving it as a PDF or plain text (.txt) and re-uploading."
         )
+
+
+async def fetch_and_convert_url(url: str) -> Optional[str]:
+    """
+    Fetches a URL and converts it to Markdown.
+    """
+    logger.info(f"Implicitly scraping URL: {url}")
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            response = await client.get(
+                url, 
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            )
+            response.raise_for_status()
+            html_content = response.text
+            
+        def _save(data: str) -> str:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode="w", encoding="utf-8") as tmp:
+                tmp.write(data)
+                return tmp.name
+
+        tmp_path = await asyncio.to_thread(_save, html_content)
+        
+        try:
+            markdown_text = await asyncio.to_thread(_run_markitdown, tmp_path)
+            if markdown_text and markdown_text.strip():
+                logger.info(f"Successfully scraped URL: {url} ({len(markdown_text)} chars)")
+                return markdown_text
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+                
+    except Exception as e:
+        logger.warning(f"Failed to scrape URL {url}: {e}")
+        
+    return None
 
 
 async def save_markdown_as_tempfile(markdown_text: str, original_display_name: str) -> str:

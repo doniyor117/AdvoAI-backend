@@ -31,6 +31,8 @@ from app.database.queries import (
     insert_message, get_session_messages, delete_oldest_message,
     log_router_analytics
 )
+from app.services.converter import fetch_and_convert_url
+import re
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -336,6 +338,20 @@ async def ask_advoai(
             ideal_top_k
         )
 
+        # ── 2.5 Extract & Fetch URLs from Prompt ────────────
+        url_pattern = re.compile(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+')
+        urls = list(set(url_pattern.findall(request.question)))
+        url_contexts = []
+        if urls:
+            logger.info(f"Detected {len(urls)} URLs in prompt. Fetching...")
+            fetch_tasks = [fetch_and_convert_url(url) for url in urls]
+            results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+            for url, res in zip(urls, results):
+                if isinstance(res, str):
+                    url_contexts.append(f"### Content from {url}\n{res}")
+                else:
+                    logger.warning(f"Failed to fetch {url}: {res}")
+
         # ── 3. RAG retrieval pipeline (if needed) ───────────
         rag_result = {}
         if intent == "create_contract":
@@ -367,8 +383,8 @@ async def ask_advoai(
                     top_k=ideal_top_k,
                 )
 
-                # Guard: no documents found
-                if not rag_result.get("parent_documents"):
+                # Guard: no documents found and no URL context
+                if not rag_result.get("parent_documents") and not url_contexts:
                     return {
                         "answer": "I couldn't find any relevant legal documents in my database to answer this question. Please try rephrasing or asking about a different topic.",
                         "sources": [],
@@ -377,6 +393,18 @@ async def ask_advoai(
                         "chunks_used": 0,
                         "intent": intent,
                     }
+
+        # Inject URL context into the rag result
+        if url_contexts:
+            combined_url_text = "\n\n".join(url_contexts)
+            existing_context = rag_result.get("context_markdown", "")
+            rag_result["context_markdown"] = existing_context + "\n\n" + combined_url_text if existing_context else combined_url_text
+            
+            # Optionally add them as sources
+            parents = rag_result.get("parent_documents", [])
+            for url in urls:
+                parents.append({"title": f"Webpage: {url}", "source_url": url})
+            rag_result["parent_documents"] = parents
 
         # ── 4. Verify & Re-upload Expired Attachments ───────
         if request.attachments:

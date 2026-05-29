@@ -44,7 +44,8 @@ When a message arrives, it is intercepted by our powerful reasoning model (Gemma
 
 ### 3. The Generator (`gemini-3.1-flash-lite`)
 - The retrieved parent documents, the optimized context, and the full multi-turn conversational history are fed into the main Gemini model.
-- The model generates a highly accurate, grounded, and conversational legal response based *only* on the provided context.
+- **Implicit Web Scraping**: If the user pastes a URL in their prompt, the backend automatically intercepts it, fetches the webpage concurrently, converts the HTML to Markdown via `MarkItDown`, and injects it into the LLM context along with properly formatted citations.
+- The model generates a highly accurate, grounded, and conversational legal response based *only* on the provided context and uploaded attachments.
 
 ### 4. Hybrid Sliding Window History
 To maintain context over long conversations without blowing up token limits:

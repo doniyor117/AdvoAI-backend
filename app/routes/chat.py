@@ -342,6 +342,7 @@ async def ask_advoai(
         url_pattern = re.compile(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+')
         urls = list(set(url_pattern.findall(request.question)))
         url_contexts = []
+        url_parents = []
         if urls:
             logger.info(f"Detected {len(urls)} URLs in prompt. Fetching...")
             fetch_tasks = [fetch_and_convert_url(url) for url in urls]
@@ -349,6 +350,12 @@ async def ask_advoai(
             for url, res in zip(urls, results):
                 if isinstance(res, str):
                     url_contexts.append(f"### Content from {url}\n{res}")
+                    url_parents.append({
+                        "source_doc_id": f"url-{url}",
+                        "root_title": f"Webpage: {url}",
+                        "source_url": url,
+                        "full_markdown": res
+                    })
                 else:
                     logger.warning(f"Failed to fetch {url}: {res}")
 
@@ -400,10 +407,9 @@ async def ask_advoai(
             existing_context = rag_result.get("context_markdown", "")
             rag_result["context_markdown"] = existing_context + "\n\n" + combined_url_text if existing_context else combined_url_text
             
-            # Optionally add them as sources
+            # Add them as sources with proper metadata for citations
             parents = rag_result.get("parent_documents", [])
-            for url in urls:
-                parents.append({"title": f"Webpage: {url}", "source_url": url})
+            parents.extend(url_parents)
             rag_result["parent_documents"] = parents
 
         # ── 4. Verify & Re-upload Expired Attachments ───────

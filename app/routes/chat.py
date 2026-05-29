@@ -426,7 +426,6 @@ async def ask_advoai(
                                     }
                                 )
                                 # Wait for ACTIVE state
-                                import asyncio
                                 max_wait_seconds = 30
                                 waited = 0
                                 while getattr(uploaded_file, "state", None) and \

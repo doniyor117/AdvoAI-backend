@@ -57,15 +57,56 @@ class GeminiEmbedder:
             List of floats (length = settings.EMBEDDING_DIMENSIONS).
         """
         formatted = f"task: question answering | query: {text}"
-        client = api_key_manager.get_current_client()
-        result = await client.aio.models.embed_content(
-            model=self.model,
-            contents=formatted,
-            config=types.EmbedContentConfig(
-                output_dimensionality=self.dimensions
-            ),
-        )
-        return list(result.embeddings[0].values)
+        
+        retries = max(10, len(api_key_manager.keys) * 3)
+        backoff = 30
+        keys_tried = 1
+        
+        for attempt in range(retries):
+            try:
+                client = api_key_manager.get_current_client()
+                result = await client.aio.models.embed_content(
+                    model=self.model,
+                    contents=formatted,
+                    config=types.EmbedContentConfig(
+                        output_dimensionality=self.dimensions
+                    ),
+                )
+                return list(result.embeddings[0].values)
+            except Exception as err:
+                err_str = str(err)
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    if attempt == retries - 1:
+                        raise
+                    
+                    # Rotate API key if we have more than one key
+                    if len(api_key_manager.keys) > 1 and keys_tried < len(api_key_manager.keys):
+                        api_key_manager.rotate_key()
+                        keys_tried += 1
+                        logger.info("Retrying embed_query immediately with new API key...")
+                        continue # retry immediately without sleeping
+                    
+                    # We tried all available keys (or only have 1), so we MUST sleep to reset the limits
+                    sleep_seconds = backoff
+                    import re
+                    # Try matching 'retryDelay': '44s' or 'retryDelay: "44s"'
+                    match = re.search(r"retryDelay['\"]:\s*['\"](\d+)s['\"]", err_str)
+                    if match:
+                        sleep_seconds = int(match.group(1)) + 2  # add safety buffer
+                    else:
+                        # Try matching 'Please retry in 44.2297s'
+                        match_float = re.search(r"retry in (\d+\.?\d*)s", err_str)
+                        if match_float:
+                            sleep_seconds = int(float(match_float.group(1))) + 2
+                    
+                    logger.warning(
+                        f"Gemini API rate limit (429) hit on all keys. Sleeping for {sleep_seconds}s before retrying embed_query (attempt {attempt + 1}/{retries})..."
+                    )
+                    await asyncio.sleep(sleep_seconds)
+                    backoff *= 2  # Double the backoff window for next attempt
+                    keys_tried = 1  # Reset counter after sleeping
+                else:
+                    raise
 
     async def embed_chunks(
         self,

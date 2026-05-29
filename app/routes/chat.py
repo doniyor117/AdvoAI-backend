@@ -367,13 +367,13 @@ async def ask_advoai(
             template_text = get_template(contract_type)
             rag_result = {
                 "context_markdown": f"## RECOMMENDED TEMPLATE FOR DRAFTING\n{template_text}\n\nNote to AI: Use this template as a starting point. Adjust it based on the user's specific details or requests.",
-                "parent_documents": [{"title": "Contract Templates", "source_url": "internal"}]
+                "parent_documents": []
             }
         elif intent == "compare_contracts":
             # For comparison, we rely entirely on the attachments provided by the user.
             rag_result = {
                 "context_markdown": "Note to AI: The user wants to compare the attached documents. Focus entirely on analyzing the attachments.",
-                "parent_documents": [{"title": "User Attachments", "source_url": "user"}]
+                "parent_documents": []
             }
         elif not is_conversational:
             # If user has attached files, skip RAG injection entirely.

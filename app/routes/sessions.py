@@ -13,7 +13,8 @@ from typing import Optional
 from app.middleware import require_auth
 from app.database.queries import (
     create_session, get_user_sessions, get_session_by_id,
-    rename_session, toggle_pin_session, delete_session
+    rename_session, toggle_pin_session, delete_session,
+    get_session_messages
 )
 
 router = APIRouter()
@@ -58,6 +59,19 @@ async def get_session(session_id: str, user=Depends(require_auth)):
     if session["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Access denied.")
     return {"session": session}
+
+
+@router.get("/{session_id}/messages")
+async def get_messages(session_id: str, user=Depends(require_auth)):
+    """Gets the message history for a specific session."""
+    session = await get_session_by_id(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    if session["user_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Access denied.")
+    
+    messages = await get_session_messages(session_id, limit=500)
+    return {"messages": messages}
 
 
 @router.patch("/{session_id}")

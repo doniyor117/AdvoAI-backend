@@ -88,7 +88,7 @@ def _split_markdown_into_parts(markdown: str, title: str, doc_uuid: str) -> List
 
 # ── Main Pipeline ─────────────────────────────────────────────
 
-async def process_and_ingest_law(url: str, skip_db: bool = False) -> Optional[Dict[str, Any]]:
+async def process_and_ingest_law(url: str, skip_db: bool = False, category: str = "General") -> Optional[Dict[str, Any]]:
     """
     End-to-end ingestion of a single Lex.uz legal document.
     """
@@ -147,6 +147,7 @@ async def process_and_ingest_law(url: str, skip_db: bool = False) -> Optional[Di
         "act_type": metadata.get("act_type", "Unknown"),
         "doc_date": metadata.get("doc_date"),
         "source_url": base_metadata.get("source_url", url.split("?")[0]),
+        "category": category,
         "is_active": base_metadata.get("is_active", True),
     }
 

@@ -13,6 +13,7 @@ from app.database.queries import (
     create_verification_code, get_verification_code, delete_verification_codes_by_email,
     update_user_password, update_user_email, link_google_id, unlink_google_id
 )
+from app.database.connection import get_connection
 from app.services.email import (
     generate_otp, get_otp_expiry,
     send_password_reset_otp, send_email_change_otp
@@ -27,6 +28,13 @@ logger = logging.getLogger(__name__)
 class UpdatePasswordRequest(BaseModel):
     current_password: str
     new_password: str = Field(..., min_length=8)
+
+class UpdateAdminPasswordRequest(BaseModel):
+    current_admin_password: str
+    new_admin_password: str = Field(..., min_length=8)
+
+class UpdatePrivacyRequest(BaseModel):
+    allow_data_collection: bool
 
 class RequestResetPasswordRequest(BaseModel):
     email: EmailStr
@@ -64,6 +72,38 @@ async def update_password(request: UpdatePasswordRequest, user=Depends(get_curre
     new_hash = _hash_password(request.new_password)
     await update_user_password(user["id"], new_hash)
     return {"message": "Password updated successfully"}
+
+
+@router.post("/update-admin-password")
+async def update_admin_password(request: UpdateAdminPasswordRequest, user=Depends(get_current_user)):
+    """Updates a user's admin password."""
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can have admin passwords.")
+
+    async with get_connection() as cur:
+        await cur.execute("SELECT admin_password_hash FROM users WHERE id = %s", (user["id"],))
+        row = await cur.fetchone()
+        
+    db_hash = row.get("admin_password_hash") if row else None
+    
+    if db_hash and not _verify_password(request.current_admin_password, db_hash):
+        raise HTTPException(status_code=401, detail="Incorrect current admin password")
+
+    new_hash = _hash_password(request.new_admin_password)
+    async with get_connection() as cur:
+        await cur.execute("UPDATE users SET admin_password_hash = %s WHERE id = %s", (new_hash, user["id"]))
+        
+    return {"message": "Admin password updated successfully"}
+
+@router.post("/update-privacy")
+async def update_privacy(request: UpdatePrivacyRequest, user=Depends(get_current_user)):
+    """Updates privacy settings."""
+    async with get_connection() as cur:
+        await cur.execute(
+            "UPDATE users SET allow_data_collection = %s WHERE id = %s",
+            (request.allow_data_collection, user["id"])
+        )
+    return {"message": "Privacy settings updated", "allow_data_collection": request.allow_data_collection}
 
 
 @router.post("/request-password-reset")

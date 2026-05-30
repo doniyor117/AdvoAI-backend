@@ -66,5 +66,35 @@ class ApiKeyManager:
                 
             return self._clients[self.keys[self.active_index]]
 
+    def reload_keys(self):
+        """Synchronously trigger reloading in a background task or handle via next request?
+        Actually, let's make reload_keys an async method."""
+        pass
+
+    async def async_reload_keys(self):
+        """Reloads API keys from the database or settings."""
+        from app.database.queries import get_setting
+        custom_keys_str = await get_setting("custom_api_keys")
+        
+        with self._lock:
+            if custom_keys_str and custom_keys_str.strip():
+                new_keys = [k.strip() for k in custom_keys_str.split(",") if k.strip()]
+            else:
+                new_keys = settings.get_google_api_keys()
+                
+            if not new_keys:
+                logger.error("No API keys found during reload.")
+                return
+
+            self.keys = new_keys
+            self.active_index = 0
+            
+            # Update clients map
+            for k in self.keys:
+                if k not in self._clients:
+                    self._clients[k] = genai.Client(api_key=k)
+                    
+            logger.info(f"🔑 ApiKeyManager reloaded with {len(self.keys)} API key(s).")
+
 # Global singleton instance
 api_key_manager = ApiKeyManager()

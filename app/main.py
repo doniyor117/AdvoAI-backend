@@ -36,6 +36,8 @@ async def lifespan(app: FastAPI):
     from app.database.connection import init_pool, close_pool
     logger.info("AdvoAI Backend starting up...")
     await init_pool()
+    from app.services.api_keys import api_key_manager
+    await api_key_manager.async_reload_keys()
     yield
     logger.info("AdvoAI Backend shutting down...")
     await close_pool()
@@ -84,9 +86,10 @@ def root():
 
 # ── API Routes ────────────────────────────────────────────────
 
-from app.routes import health, chat, auth, sessions, admin, account
+from app.routes import health, chat, auth, sessions, admin, account, public
 
 app.include_router(health.router,    prefix="/api/health",    tags=["Health"])
+app.include_router(public.router,    prefix="/api/public",    tags=["Public"])
 app.include_router(auth.router,      prefix="/api/auth",      tags=["Auth"])
 app.include_router(account.router,   prefix="/api/account",   tags=["Account"])
 app.include_router(chat.router,      prefix="/api/chat",      tags=["Chat"])

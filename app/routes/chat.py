@@ -320,23 +320,27 @@ async def ask_advoai(
         if request.attachments:
             router_question += f" [User attached {len(request.attachments)} file(s)]"
 
+        import time
+        start_router = time.monotonic()
         routing_data = await client.route_query(router_question, recent_messages=recent_messages if session_id else None)
+        router_time_ms = int((time.monotonic() - start_router) * 1000)
+        
         intent = routing_data.get("intent", "legal_rag")
         search_query = routing_data.get("search_query", request.question)
         ideal_top_k = routing_data.get("ideal_top_k", request.top_k)
         
-        is_conversational = (intent == "conversational")
-        logger.info(f"Query routed as: {intent} | Optimized Search Query: {search_query} | Ideal Top-K: {ideal_top_k}")
+        # Override Top-K if enabled in settings
+        from app.database.queries import get_setting
+        override_enabled = await get_setting("override_rag_top_k") == "true"
+        if override_enabled:
+            global_top_k = await get_setting("rag_top_k")
+            if global_top_k and global_top_k.isdigit():
+                ideal_top_k = int(global_top_k)
+                logger.info(f"Overriding Top-K with global setting: {ideal_top_k}")
         
-        # Log analytics in the background to reduce response latency
-        background_tasks.add_task(
-            log_router_analytics,
-            session_id,
-            request.question,
-            intent,
-            search_query,
-            ideal_top_k
-        )
+        is_conversational = (intent == "conversational")
+        logger.info(f"Query routed as: {intent} | Optimized Search Query: {search_query} | Ideal Top-K: {ideal_top_k} | Router Time: {router_time_ms}ms | Router Model: {client.router_model}")
+
 
         # ── 2.5 Extract & Fetch URLs from Prompt ────────────
         url_pattern = re.compile(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+')
@@ -377,7 +381,7 @@ async def ask_advoai(
             }
         elif not is_conversational:
             # We always run RAG if it's not conversational, even with attachments!
-            # Gemini 1.5 has a massive context window, so token overflow is not a concern.
+            # Gemini 3 has a massive context window, so token overflow is not a concern.
             rag_result = await retrieve_context(
                 question=search_query,
                 top_k=ideal_top_k,
@@ -451,7 +455,9 @@ async def ask_advoai(
                                     pass
 
         # ── 5. Generate answer with Main LLM ────────────────
+        llm_time_ms = None
         try:
+            start_llm = time.monotonic()
             llm_result = await client.ask(
                 question=request.question,
                 structured_history=recent_messages,
@@ -460,6 +466,8 @@ async def ask_advoai(
                 is_conversational=is_conversational,
                 attachments=request.attachments
             )
+            llm_time_ms = int((time.monotonic() - start_llm) * 1000)
+            logger.info(f"✅ Main LLM ({client.main_model}) generation completed in {llm_time_ms}ms")
         except (OSError, ConnectionError) as net_err:
             logger.error(f"LLM network error (DNS/connection): {net_err}")
             raise HTTPException(
@@ -494,6 +502,18 @@ async def ask_advoai(
 
             except Exception as se:
                 logger.warning(f"Message insert failed (non-fatal): {se}")
+                
+        # Log analytics in the background
+        background_tasks.add_task(
+            log_router_analytics,
+            session_id,
+            request.question,
+            intent,
+            search_query,
+            ideal_top_k,
+            router_time_ms,
+            llm_time_ms
+        )
 
         # ── 6. Format response for frontend ─────────────────
         safe_citations = []

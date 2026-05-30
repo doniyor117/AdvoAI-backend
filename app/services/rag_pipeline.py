@@ -44,7 +44,7 @@ async def retrieve_context(question: str, top_k: int = 5) -> Dict[str, Any]:
 
     # Step 2: Vector search — top-K similar chunks
     matched_chunks = await search_similar_chunks(query_embedding, top_k=top_k)
-    logger.info(f"Matched {len(matched_chunks)} chunks")
+    logger.info(f"Matched {len(matched_chunks)} vector chunks from pgvector")
 
     if matched_chunks:
         logger.info(f"Top similarity score: {matched_chunks[0]['similarity']:.4f}")
@@ -62,7 +62,7 @@ async def retrieve_context(question: str, top_k: int = 5) -> Dict[str, Any]:
         for doc in parent_documents
     )
 
-    logger.info(f"Context ready: {len(context_markdown):,} chars")
+    logger.info(f"Context ready: {len(parent_documents)} unique parent documents | {len(context_markdown):,} chars total")
 
     return {
         "question": question,

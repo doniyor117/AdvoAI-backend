@@ -37,9 +37,17 @@ class GeminiClient:
     Uses ApiKeyManager to handle rate limits with multiple keys.
     """
 
-    def __init__(self, main_model: str = "gemini-3.1-flash-lite", router_model: str = "gemma-4-31b-it"):
+    def __init__(
+        self, 
+        main_model: str = "gemini-3.1-flash-lite", 
+        router_model: str = "gemma-4-31b-it",
+        custom_main_prompt: str = None,
+        custom_router_prompt: str = None
+    ):
         self.main_model = main_model
         self.router_model = router_model
+        self.custom_main_prompt = custom_main_prompt
+        self.custom_router_prompt = custom_router_prompt
 
         logger.info(f"🤖 Main LLM initialized: {self.main_model}")
         logger.info(f"🧠 Router LLM initialized: {self.router_model}")
@@ -86,7 +94,7 @@ class GeminiClient:
         logger.info("🧠 Routing query intent...")
         
         config = types.GenerateContentConfig(
-            system_instruction=ROUTER_SYSTEM_PROMPT,
+            system_instruction=self.custom_router_prompt or ROUTER_SYSTEM_PROMPT,
             temperature=0.0,  # Zero temperature for strict instruction following
             thinking_config=types.ThinkingConfig(thinking_level="MINIMAL")
         )
@@ -203,7 +211,7 @@ class GeminiClient:
         
         config = types.GenerateContentConfig(
             temperature=0.3,
-            system_instruction=SYSTEM_PROMPT
+            system_instruction=self.custom_main_prompt or SYSTEM_PROMPT
         )
 
         response = await self._generate_with_retry(

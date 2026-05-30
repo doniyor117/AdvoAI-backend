@@ -8,7 +8,7 @@ Uses JWT tokens stored in HTTP-only cookies.
 import logging
 from datetime import datetime, timezone, timedelta
 
-from fastapi import APIRouter, HTTPException, Response, Request
+from fastapi import APIRouter, HTTPException, Response, Request, Depends
 from pydantic import BaseModel, EmailStr, Field
 
 import bcrypt
@@ -37,6 +37,7 @@ class RegisterRequest(BaseModel):
     password: str = Field(..., min_length=8, description="Minimum 8 characters")
     full_name: str = Field(..., min_length=2)
     otp: str = Field(..., min_length=6, max_length=6, description="6-digit verification code")
+    allow_data_collection: bool = True
 
 
 class LoginRequest(BaseModel):
@@ -55,6 +56,7 @@ class UserResponse(BaseModel):
     role: str
     auth_provider: str
     email_verified: bool
+    terms_accepted: bool
 
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -97,6 +99,8 @@ def _user_to_response(user: dict) -> dict:
         "email_verified": user.get("email_verified", False),
         "has_password": bool(user.get("password_hash")),
         "is_google_linked": bool(user.get("google_id")),
+        "allow_data_collection": user.get("allow_data_collection", True),
+        "terms_accepted": bool(user.get("terms_accepted_at")),
     }
 
 
@@ -146,6 +150,8 @@ async def register(request: RegisterRequest, response: Response):
         password_hash=password_hash,
         full_name=request.full_name,
         auth_provider="email",
+        allow_data_collection=request.allow_data_collection,
+        terms_accepted_at=datetime.now(timezone.utc)
     )
 
     if not user:
@@ -164,6 +170,35 @@ async def register(request: RegisterRequest, response: Response):
         "message": "Account created successfully.",
         "user": _user_to_response(user),
         "token": token,
+    }
+
+
+class ConsentRequest(BaseModel):
+    allow_data_collection: bool
+
+@router.post("/submit-consent")
+async def submit_consent(request: ConsentRequest, current_user=Depends(get_current_user)):
+    """
+    Submits user consent for Terms of Service and Data Collection.
+    Primarily used during the Google SSO consent gate.
+    """
+    from app.database.queries import update_user_consent, get_user_by_id
+    
+    # We implicitly consider calling this endpoint as accepting the terms
+    terms_accepted_at = datetime.now(timezone.utc)
+    
+    await update_user_consent(
+        user_id=str(current_user["id"]),
+        allow_data_collection=request.allow_data_collection,
+        terms_accepted_at=terms_accepted_at
+    )
+    
+    # Refresh user object to return
+    updated_user = await get_user_by_id(str(current_user["id"]))
+    
+    return {
+        "message": "Consent successfully recorded.",
+        "user": _user_to_response(updated_user)
     }
 
 

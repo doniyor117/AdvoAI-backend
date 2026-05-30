@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS public.documents
     act_type        character varying(50) DEFAULT 'Unknown',
     doc_date        date DEFAULT NULL,
     source_url      text NOT NULL,
+    category        varchar(50) DEFAULT 'General',
     is_active       boolean DEFAULT TRUE,
     created_at      timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id)
@@ -77,6 +78,7 @@ CREATE TABLE IF NOT EXISTS public.users (
     google_id       varchar(255) UNIQUE,
     email_verified  boolean DEFAULT FALSE,
     is_active       boolean DEFAULT TRUE,
+    admin_password_hash varchar(255),
     created_at      timestamptz DEFAULT NOW(),
     last_login_at   timestamptz
 );
@@ -110,6 +112,16 @@ CREATE TABLE IF NOT EXISTS public.chat_messages (
     role            varchar(20) NOT NULL CHECK (role IN ('user', 'assistant')),
     content         text NOT NULL,
     created_at      timestamptz DEFAULT NOW()
+);
+
+-- Ingestion Jobs table (for background batch ingestion)
+CREATE TABLE IF NOT EXISTS public.ingestion_jobs (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    url           text NOT NULL,
+    status        varchar(20) NOT NULL DEFAULT 'pending', -- pending, processing, completed, failed
+    error_message text,
+    created_at    timestamptz DEFAULT NOW(),
+    updated_at    timestamptz DEFAULT NOW()
 );
 
 -- Usage tracking
@@ -157,7 +169,11 @@ INSERT INTO system_settings (key, value) VALUES
     ('free_daily_doc_limit', '10'),
     ('free_daily_image_limit', '10'),
     ('guest_doc_limit', '2'),
-    ('guest_image_limit', '2')
+    ('guest_image_limit', '2'),
+    ('ui_welcome_title', 'Welcome to AdvoAI'),
+    ('ui_welcome_message', 'How can I assist you with Uzbekistan law today?'),
+    ('ui_support_email', 'support@advoai.uz'),
+    ('ui_footer_text', 'AdvoAI provides AI-generated guidance. Please consult a human lawyer for official advice.')
 ON CONFLICT (key) DO NOTHING;
 
 -- Safely add is_banned column to users (idempotent)
@@ -176,5 +192,12 @@ CREATE TABLE IF NOT EXISTS public.router_analytics (
     ideal_top_k     integer,
     created_at      timestamptz DEFAULT NOW()
 );
+
+-- V5: Missing columns and Performance Tracking (safe) -- User Settings & Privacy
+ALTER TABLE public.users ADD COLUMN IF NOT EXISTS allow_data_collection BOOLEAN DEFAULT TRUE;
+ALTER TABLE public.users ADD COLUMN IF NOT EXISTS terms_accepted_at TIMESTAMPTZ;
+ALTER TABLE public.chat_messages ADD COLUMN IF NOT EXISTS sources JSONB DEFAULT '[]'::jsonb;
+ALTER TABLE public.router_analytics ADD COLUMN IF NOT EXISTS router_time_ms INTEGER;
+ALTER TABLE public.router_analytics ADD COLUMN IF NOT EXISTS llm_time_ms INTEGER;
 
 COMMIT;

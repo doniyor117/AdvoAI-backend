@@ -75,11 +75,11 @@ async def insert_document(record: Dict[str, Any]) -> None:
     sql = """
         INSERT INTO documents (
             id, source_doc_id, title, act_type,
-            doc_date, source_url, is_active
+            doc_date, source_url, category, is_active
         )
         VALUES (
             %(id)s, %(source_doc_id)s, %(title)s, %(act_type)s,
-            %(doc_date)s, %(source_url)s, %(is_active)s
+            %(doc_date)s, %(source_url)s, %(category)s, %(is_active)s
         );
     """
     async with get_connection() as cur:
@@ -209,6 +209,8 @@ def _user_row(row) -> Dict[str, Any]:
         "email_verified": row["email_verified"],
         "is_active": row["is_active"],
         "is_banned": row.get("is_banned", False),
+        "allow_data_collection": row.get("allow_data_collection", True),
+        "terms_accepted_at": row.get("terms_accepted_at"),
         "created_at": row["created_at"],
         "last_login_at": row.get("last_login_at"),
     }
@@ -221,15 +223,17 @@ async def create_user(
     auth_provider: str = "email",
     google_id: str = None,
     email_verified: bool = False,
+    allow_data_collection: bool = True,
+    terms_accepted_at: datetime = None,
 ) -> Optional[Dict[str, Any]]:
     sql = """
-        INSERT INTO users (email, password_hash, full_name, auth_provider, google_id, email_verified)
-        VALUES (%s, %s, %s, %s, %s, %s)
+        INSERT INTO users (email, password_hash, full_name, auth_provider, google_id, email_verified, allow_data_collection, terms_accepted_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id, email, password_hash, full_name, role, auth_provider,
-                  google_id, email_verified, is_active, is_banned, created_at, last_login_at;
+                  google_id, email_verified, is_active, is_banned, allow_data_collection, terms_accepted_at, created_at, last_login_at;
     """
     async with get_connection() as cur:
-        await cur.execute(sql, (email, password_hash, full_name, auth_provider, google_id, email_verified))
+        await cur.execute(sql, (email, password_hash, full_name, auth_provider, google_id, email_verified, allow_data_collection, terms_accepted_at))
         row = cur.fetchone()
     return _user_row(row) if row else None
 
@@ -237,7 +241,7 @@ async def create_user(
 async def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
     sql = """
         SELECT id, email, password_hash, full_name, role, auth_provider,
-               google_id, email_verified, is_active, is_banned, created_at, last_login_at
+               google_id, email_verified, is_active, is_banned, allow_data_collection, terms_accepted_at, created_at, last_login_at
         FROM users WHERE email = %s;
     """
     async with get_connection() as cur:
@@ -249,7 +253,7 @@ async def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
 async def get_user_by_id(user_id: str) -> Optional[Dict[str, Any]]:
     sql = """
         SELECT id, email, password_hash, full_name, role, auth_provider,
-               google_id, email_verified, is_active, is_banned, created_at, last_login_at
+               google_id, email_verified, is_active, is_banned, allow_data_collection, terms_accepted_at, created_at, last_login_at
         FROM users WHERE id = %s::uuid;
     """
     async with get_connection() as cur:
@@ -262,7 +266,7 @@ async def get_user_by_google_id(google_id: str) -> Optional[Dict[str, Any]]:
     """Retrieves a user by their Google ID."""
     sql = """
         SELECT id, email, password_hash, full_name, role, auth_provider,
-               google_id, email_verified, is_active, is_banned, created_at, last_login_at
+               google_id, email_verified, is_active, is_banned, allow_data_collection, terms_accepted_at, created_at, last_login_at
         FROM users WHERE google_id = %s;
     """
     async with get_connection() as cur:
@@ -595,11 +599,42 @@ async def get_all_users() -> List[Dict[str, Any]]:
     ]
 
 
-async def update_user_role(user_id: str, role: str) -> None:
+async def update_user_role(user_id: str, role: str, admin_password_hash: Optional[str] = None) -> None:
+    # root_admin can ONLY be assigned via direct database edit, never through the API
     if role not in ("guest", "free", "admin"):
-        raise ValueError(f"Invalid role: {role}")
+        raise ValueError(f"Invalid role '{role}'. Promoting to root_admin is not allowed via API.")
     async with get_connection() as cur:
-        await cur.execute("UPDATE users SET role = %s WHERE id = %s::uuid;", (role, user_id))
+        if admin_password_hash is not None:
+            await cur.execute(
+                "UPDATE users SET role = %s, admin_password_hash = %s WHERE id = %s::uuid;",
+                (role, admin_password_hash, user_id)
+            )
+        else:
+            await cur.execute("UPDATE users SET role = %s WHERE id = %s::uuid;", (role, user_id))
+
+
+async def delete_user(user_id: str) -> bool:
+    """
+    Hard-deletes a user and all their associated data (sessions, messages, usage logs).
+    The user will need to register again. Returns True if a row was deleted.
+    """
+    async with get_connection() as cur:
+        await cur.execute("DELETE FROM users WHERE id = %s::uuid RETURNING id;", (user_id,))
+        row = cur.fetchone()
+        return bool(row)
+
+
+async def update_user_consent(user_id: str, allow_data_collection: bool, terms_accepted_at: datetime = None):
+    """Updates user privacy consent and terms acceptance timestamp."""
+    sql = "UPDATE users SET allow_data_collection = %s"
+    params = [allow_data_collection]
+    if terms_accepted_at:
+        sql += ", terms_accepted_at = %s"
+        params.append(terms_accepted_at)
+    sql += " WHERE id = %s::uuid;"
+    params.append(user_id)
+    async with get_connection() as cur:
+        await cur.execute(sql, tuple(params))
 
 
 async def get_admin_stats() -> Dict[str, Any]:
@@ -607,12 +642,14 @@ async def get_admin_stats() -> Dict[str, Any]:
         WITH
             user_count     AS (SELECT COUNT(*) AS n FROM users),
             doc_count      AS (SELECT COUNT(*) AS n FROM documents),
+            part_count     AS (SELECT COUNT(*) AS n FROM document_parts),
             chunk_count    AS (SELECT COUNT(*) AS n FROM chunks),
             dau            AS (SELECT COUNT(DISTINCT user_id) AS n FROM usage_logs WHERE usage_date = CURRENT_DATE),
             daily_msgs     AS (SELECT COALESCE(SUM(message_count), 0) AS n FROM usage_logs WHERE usage_date = CURRENT_DATE)
         SELECT
             (SELECT n FROM user_count)   AS total_users,
             (SELECT n FROM doc_count)    AS total_documents,
+            (SELECT n FROM part_count)   AS total_document_parts,
             (SELECT n FROM chunk_count)  AS total_chunks,
             (SELECT n FROM dau)          AS daily_active_users,
             (SELECT n FROM daily_msgs)   AS daily_messages;
@@ -624,16 +661,164 @@ async def get_admin_stats() -> Dict[str, Any]:
     return {
         "total_users": row["total_users"],
         "total_documents": row["total_documents"],
+        "total_document_parts": row["total_document_parts"],
         "total_chunks": row["total_chunks"],
         "daily_active_users": row["daily_active_users"],
         "daily_messages": row["daily_messages"],
     }
 
 
+async def get_time_series_stats(range_val: str, target_user_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Returns time-series data for messages and active users.
+    range_val: '1h', '24h', '7d', '30d', 'all'
+    """
+    if range_val == '10m':
+        interval = "NOW() - INTERVAL '10 minutes'"
+        trunc = "minute"
+    elif range_val == '30m':
+        interval = "NOW() - INTERVAL '30 minutes'"
+        trunc = "minute"
+    elif range_val == '1h':
+        interval = "NOW() - INTERVAL '1 hour'"
+        trunc = "minute"
+    elif range_val == '24h':
+        interval = "NOW() - INTERVAL '24 hours'"
+        trunc = "hour"
+    elif range_val == '7d':
+        interval = "CURRENT_DATE - INTERVAL '6 days'"
+        trunc = "day"
+    elif range_val == '30d':
+        interval = "CURRENT_DATE - INTERVAL '29 days'"
+        trunc = "day"
+    else:
+        interval = "'2000-01-01'::timestamp"
+        trunc = "day" if range_val != 'all' else "week"
+        
+    user_filter = "AND s.user_id = %s" if target_user_id else ""
+    params = (target_user_id,) if target_user_id else ()
+
+    sql = f"""
+        SELECT 
+            date_trunc('{trunc}', m.created_at) as period,
+            COUNT(m.id) as message_count,
+            COUNT(DISTINCT s.user_id) as active_users
+        FROM chat_messages m
+        JOIN chat_sessions s ON m.session_id = s.id
+        WHERE m.created_at >= {interval}
+        {user_filter}
+        GROUP BY period
+        ORDER BY period ASC;
+    """
+    
+    async with get_connection() as cur:
+        await cur.execute(sql, params)
+        rows = cur.fetchall()
+        
+    return {
+        "data": [
+            {
+                "period": row["period"].isoformat() if row["period"] else None,
+                "message_count": row["message_count"],
+                "active_users": row["active_users"]
+            }
+            for row in rows
+        ]
+    }
+
+
+async def get_router_analytics_stats(range_val: str) -> Dict[str, Any]:
+    """
+    Returns RAG vs Conversational stats.
+    """
+    if range_val == '1h':
+        interval = "NOW() - INTERVAL '1 hour'"
+    elif range_val == '24h':
+        interval = "NOW() - INTERVAL '24 hours'"
+    elif range_val == '7d':
+        interval = "CURRENT_DATE - INTERVAL '6 days'"
+    elif range_val == '30d':
+        interval = "CURRENT_DATE - INTERVAL '29 days'"
+    else:
+        interval = "'2000-01-01'::timestamp"
+
+    sql = f"""
+        SELECT 
+            intent,
+            COUNT(id) as count
+        FROM router_analytics
+        WHERE created_at >= {interval}
+        GROUP BY intent;
+    """
+    async with get_connection() as cur:
+        await cur.execute(sql)
+        rows = cur.fetchall()
+        
+    stats = {row["intent"]: row["count"] for row in rows}
+    total = sum(stats.values())
+    
+    return {
+        "intents": stats,
+        "total": total
+    }
+
+# ── Bulk Ingestion Jobs ──────────────────────────────────────
+
+async def create_ingestion_jobs(urls: List[str]) -> List[Dict[str, Any]]:
+    sql = """
+        INSERT INTO ingestion_jobs (url, status)
+        VALUES (%s, 'pending')
+        RETURNING id, url, status, created_at;
+    """
+    jobs = []
+    async with get_connection() as cur:
+        for url in urls:
+            await cur.execute(sql, (url,))
+            row = cur.fetchone()
+            jobs.append({
+                "id": row["id"],
+                "url": row["url"],
+                "status": row["status"],
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None
+            })
+    return jobs
+
+async def update_ingestion_job_status(job_id: str, status: str, error_message: Optional[str] = None):
+    sql = """
+        UPDATE ingestion_jobs 
+        SET status = %s, error_message = %s, updated_at = NOW()
+        WHERE id = %s::uuid;
+    """
+    async with get_connection() as cur:
+        await cur.execute(sql, (status, error_message, job_id))
+
+async def get_ingestion_jobs() -> List[Dict[str, Any]]:
+    sql = """
+        SELECT id, url, status, error_message, created_at, updated_at
+        FROM ingestion_jobs
+        ORDER BY created_at DESC
+        LIMIT 100;
+    """
+    async with get_connection() as cur:
+        await cur.execute(sql)
+        rows = cur.fetchall()
+        
+    return [
+        {
+            "id": row["id"],
+            "url": row["url"],
+            "status": row["status"],
+            "error_message": row["error_message"],
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None
+        }
+        for row in rows
+    ]
+
 async def get_all_documents_admin() -> List[Dict[str, Any]]:
     sql = """
         SELECT d.id, d.source_doc_id, d.title, d.act_type, d.doc_date,
-               d.source_url, d.is_active, d.created_at,
+               d.source_url, d.category, d.is_active, d.created_at,
                COUNT(c.id) AS chunk_count
         FROM documents d
         LEFT JOIN document_parts dp ON d.id = dp.document_id
@@ -650,6 +835,7 @@ async def get_all_documents_admin() -> List[Dict[str, Any]]:
             "id": str(r["id"]), "source_doc_id": r["source_doc_id"],
             "title": r["title"], "act_type": r["act_type"],
             "doc_date": r["doc_date"], "source_url": r["source_url"],
+            "category": r["category"],
             "is_active": r["is_active"], "created_at": r["created_at"],
             "chunk_count": r["chunk_count"],
         }
@@ -712,9 +898,12 @@ async def get_document_full(doc_id: str) -> Optional[Dict[str, Any]]:
     }
 
 
-async def update_document_title(doc_id: str, title: str) -> None:
+async def update_document_metadata(doc_id: str, title: str, category: str, act_type: str) -> None:
     async with get_connection() as cur:
-        await cur.execute("UPDATE documents SET title = %s WHERE id = %s::uuid;", (title, doc_id))
+        await cur.execute(
+            "UPDATE documents SET title = %s, category = %s, act_type = %s WHERE id = %s::uuid;", 
+            (title, category, act_type, doc_id)
+        )
 
 
 async def delete_document(doc_id: str) -> None:
@@ -763,13 +952,128 @@ async def get_user_stats(user_id: str) -> Dict[str, Any]:
         "session_count": row["session_count"],
     }
 
-async def log_router_analytics(session_id: Optional[str], raw_query: str, intent: str, optimized_query: str, ideal_top_k: int) -> None:
+async def log_router_analytics(session_id: Optional[str], raw_query: str, intent: str, optimized_query: str, ideal_top_k: int, router_time_ms: Optional[int] = None, llm_time_ms: Optional[int] = None) -> None:
     if not session_id:
         return
     sql = """
-        INSERT INTO router_analytics (session_id, raw_query, intent, optimized_query, ideal_top_k)
-        VALUES (%s::uuid, %s, %s, %s, %s)
+        INSERT INTO router_analytics (session_id, raw_query, intent, optimized_query, ideal_top_k, router_time_ms, llm_time_ms)
+        VALUES (%s::uuid, %s, %s, %s, %s, %s, %s)
     """
     async with get_connection() as cur:
-        await cur.execute(sql, (session_id, raw_query, intent, optimized_query, ideal_top_k))
+        await cur.execute(sql, (session_id, raw_query, intent, optimized_query, ideal_top_k, router_time_ms, llm_time_ms))
+
+async def get_avg_response_times(range_val: str) -> Dict[str, Any]:
+    if range_val == '10m':
+        interval = "NOW() - INTERVAL '10 minutes'"
+    elif range_val == '30m':
+        interval = "NOW() - INTERVAL '30 minutes'"
+    elif range_val == '1h':
+        interval = "NOW() - INTERVAL '1 hour'"
+    elif range_val == '24h':
+        interval = "NOW() - INTERVAL '24 hours'"
+    elif range_val == '7d':
+        interval = "CURRENT_DATE - INTERVAL '6 days'"
+    elif range_val == '30d':
+        interval = "CURRENT_DATE - INTERVAL '29 days'"
+    else:
+        interval = "'2000-01-01'::timestamp"
+
+    sql = f"""
+        SELECT 
+            AVG(router_time_ms) as avg_router_time_ms,
+            AVG(llm_time_ms) as avg_llm_time_ms
+        FROM router_analytics
+        WHERE created_at >= {interval}
+    """
+    async with get_connection() as cur:
+        await cur.execute(sql)
+        row = cur.fetchone()
+        
+    return {
+        "avg_router_time_ms": int(row["avg_router_time_ms"]) if row and row["avg_router_time_ms"] else 0,
+        "avg_llm_time_ms": int(row["avg_llm_time_ms"]) if row and row["avg_llm_time_ms"] else 0,
+    }
+
+# ── Auditing & Privacy ───────────────────────────────────────
+
+async def get_all_sessions_audited(limit: int = 50, offset: int = 0) -> List[Dict]:
+    """Returns a list of sessions, including user privacy status."""
+    sql = """
+        SELECT cs.id, cs.user_id, cs.created_at, cs.updated_at, cs.title,
+               u.full_name, u.email, u.allow_data_collection
+        FROM chat_sessions cs
+        LEFT JOIN users u ON cs.user_id = u.id
+        ORDER BY cs.updated_at DESC
+        LIMIT %s OFFSET %s
+    """
+    async with get_connection() as cur:
+        await cur.execute(sql, (limit, offset))
+        rows = cur.fetchall()
+        
+    return [
+        {
+            "id": str(r["id"]),
+            "user_id": str(r["user_id"]),
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+            "title": r["title"],
+            "full_name": r["full_name"],
+            "email": r["email"],
+            "allow_data_collection": r["allow_data_collection"]
+        }
+        for r in rows
+    ]
+
+async def get_session_messages_audited(session_id: str) -> List[Dict]:
+    """
+    Returns messages for a session.
+    It checks if the user allowed data collection. If not, returns redacted messages.
+    """
+    sql_check = """
+        SELECT u.allow_data_collection 
+        FROM chat_sessions cs
+        LEFT JOIN users u ON cs.user_id = u.id
+        WHERE cs.id = %s
+    """
+    async with get_connection() as cur:
+        await cur.execute(sql_check, (session_id,))
+        row = cur.fetchone()
+        
+    allow_data = True
+    if row and row.get('allow_data_collection') is False:
+        allow_data = False
+
+    sql_msgs = """
+        SELECT id, role, content, created_at, sources
+        FROM chat_messages
+        WHERE session_id = %s
+        ORDER BY created_at ASC
+    """
+    async with get_connection() as cur:
+        await cur.execute(sql_msgs, (session_id,))
+        messages = cur.fetchall()
+        
+    result = []
+    for m in messages:
+        msg = dict(m)
+        msg['id'] = str(msg['id'])
+        msg['created_at'] = msg['created_at'].isoformat() if msg['created_at'] else None
+        
+        if not allow_data:
+            if msg['role'] == 'user':
+                msg['content'] = "[REDACTED - User opted out of data collection]"
+            else:
+                msg['content'] = "[REDACTED - User opted out of data collection]"
+            msg['sources'] = []
+        else:
+            if isinstance(msg.get('sources'), str):
+                import json
+                try:
+                    msg['sources'] = json.loads(msg['sources'])
+                except:
+                    msg['sources'] = []
+        
+        result.append(msg)
+            
+    return result
 

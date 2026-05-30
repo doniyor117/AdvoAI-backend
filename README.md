@@ -52,6 +52,15 @@ To maintain context over long conversations without blowing up token limits:
 - The last 6 messages are kept raw for immediate multi-turn context.
 - Older messages are periodically pushed into a background worker (`FastAPI BackgroundTasks`), where `gemma-4` seamlessly integrates them into a running **Archive Summary**.
 
+### 5. Dynamic Admin Dashboard & Advanced Control
+The AdvoAI Admin panel empowers administrators to tune the AI and manage the system at scale:
+- **No-Code Prompt Injection**: Dynamically override the System Prompts for both the Router and Main LLM directly from the database.
+- **Global UI Copy Control**: Manage frontend UI elements (Welcome titles, Support Emails, Footer text) completely from the backend without editing React code.
+- **RAG Playground**: A dedicated endpoint to query the `pgvector` database directly and diagnose semantic search quality, bypassing the LLM layer.
+- **Bulk Data Ingestion & Categorization**: An asynchronous background processing system that allows admins to paste dozens of URLs and ingest laws into specific Categories/Folders seamlessly without blocking the UI.
+- **Session Auditing & Privacy**: Admins can securely review user chat transcripts to ensure quality. A robust privacy toggle (`allow_data_collection`) guarantees that opted-out users' data is strictly redacted.
+- **Admin Password Security**: A secondary authentication layer (Admin Lock Screen) protects sensitive dashboard routes, ensuring that even if an account is compromised, the admin panel remains secure.
+
 ---
 
 ## 🚀 Quick Start & Deployment

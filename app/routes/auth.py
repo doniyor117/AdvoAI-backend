@@ -323,24 +323,18 @@ async def get_me(request: Request, response: Response):
 
     # Check if the token role matches the DB role, and reissue if not
     token = request.cookies.get("advoai_token")
+    if not token:
+        # Fallback: check Authorization header
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+
     new_token = None
     if token:
-        from app.middleware import decode_access_token, create_access_token
-        from datetime import timedelta
+        from app.middleware import decode_access_token
         payload = decode_access_token(token)
         if payload and payload.get("role") != user.get("role"):
-            new_token = create_access_token({
-                "sub": str(user["id"]),
-                "role": user.get("role", "free")
-            })
-            response.set_cookie(
-                key="advoai_token",
-                value=new_token,
-                httponly=True,
-                secure=True,
-                samesite="lax",
-                max_age=timedelta(days=7).total_seconds()
-            )
+            new_token = _set_auth_cookie(response, str(user["id"]), user.get("role", "free"))
 
     resp_data = {"user": _user_to_response(user)}
     if new_token:

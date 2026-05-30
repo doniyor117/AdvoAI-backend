@@ -121,7 +121,7 @@ async def _background_history_maintenance(
     """
     try:
         # Check sliding window size
-        MAX_WINDOW_MESSAGES = 6
+        MAX_WINDOW_MESSAGES = 40
         current_messages = await get_session_messages(session_id, limit=100)
         
         if len(current_messages) > MAX_WINDOW_MESSAGES:

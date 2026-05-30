@@ -462,13 +462,21 @@ async def get_session_messages(session_id: str, limit: int = 10) -> List[Dict[st
         rows = cur.fetchall()
     
     # Reverse to return in chronological order
+    import json
     result = []
     for row in reversed(rows):
+        att_data = row.get("attachments")
+        if isinstance(att_data, str):
+            try:
+                att_data = json.loads(att_data)
+            except Exception:
+                pass
+
         result.append({
             "id": str(row["id"]),
             "role": row["role"],
             "content": row["content"],
-            "attachments": row.get("attachments") or None,
+            "attachments": att_data or None,
             "created_at": row["created_at"].isoformat()
         })
     return result

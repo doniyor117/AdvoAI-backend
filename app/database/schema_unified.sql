@@ -197,6 +197,7 @@ CREATE TABLE IF NOT EXISTS public.router_analytics (
 ALTER TABLE public.users ADD COLUMN IF NOT EXISTS allow_data_collection BOOLEAN DEFAULT TRUE;
 ALTER TABLE public.users ADD COLUMN IF NOT EXISTS terms_accepted_at TIMESTAMPTZ;
 ALTER TABLE public.chat_messages ADD COLUMN IF NOT EXISTS sources JSONB DEFAULT '[]'::jsonb;
+ALTER TABLE public.chat_messages ADD COLUMN IF NOT EXISTS attachments JSONB DEFAULT NULL;
 ALTER TABLE public.router_analytics ADD COLUMN IF NOT EXISTS router_time_ms INTEGER;
 ALTER TABLE public.router_analytics ADD COLUMN IF NOT EXISTS llm_time_ms INTEGER;
 

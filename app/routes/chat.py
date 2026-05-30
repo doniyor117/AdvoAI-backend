@@ -23,7 +23,7 @@ from app.services.converter import (
     save_markdown_as_tempfile,
 )
 from app.services.rate_limiter import check_upload_limit
-from app.services.storage import upload_file_to_s3, download_file_from_s3
+from app.services.storage import upload_file_to_s3, download_file_from_s3, generate_presigned_url
 from app.middleware import require_rate_limit, get_current_user
 from app.database.queries import (
     get_session_by_id, update_session_summary,
@@ -486,8 +486,22 @@ async def ask_advoai(
         # ── 5. Update Hybrid History (Archive Shift) ────────
         if session_id:
             try:
-                # Save the new exchange to sliding window
-                await insert_message(session_id, "user", request.question)
+                # Save the new exchange to sliding window.
+                # Only save s3_key + display_name + mime_type for attachments—
+                # Gemini URIs expire, so they're not worth persisting.
+                attachment_meta = None
+                if request.attachments:
+                    attachment_meta = [
+                        {
+                            "s3_key": att.s3_key,
+                            "display_name": att.display_name,
+                            "mime_type": att.mime_type,
+                        }
+                        for att in request.attachments
+                        if att.s3_key  # Only persist if actually in R2
+                    ] or None
+
+                await insert_message(session_id, "user", request.question, attachments=attachment_meta)
                 await insert_message(session_id, "assistant", llm_result["answer"])
 
                 # Check sliding window size and summarize in background
@@ -554,3 +568,24 @@ async def ask_advoai(
     except Exception as e:
         logger.error(f"Chat API error: {e}")
         raise HTTPException(status_code=500, detail="An error occurred while processing your request.")
+
+
+@router.get("/file/{s3_key:path}")
+async def get_attachment_url(s3_key: str, request: Request):
+    """
+    Returns a short-lived presigned URL for a file stored in R2.
+    Requires authentication to prevent unauthorized access.
+    The URL itself is time-limited (1 hour), so it's safe to expose to clients.
+    """
+    user = await get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required.")
+
+    url = await generate_presigned_url(s3_key, expires_in=3600)
+    if not url:
+        raise HTTPException(
+            status_code=404,
+            detail="File not found or storage is not configured."
+        )
+
+    return {"url": url}

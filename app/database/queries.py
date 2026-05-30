@@ -431,13 +431,19 @@ async def delete_session(session_id: str) -> None:
         await cur.execute("DELETE FROM chat_sessions WHERE id = %s::uuid;", (session_id,))
 
 
-async def insert_message(session_id: str, role: str, content: str) -> None:
+async def insert_message(session_id: str, role: str, content: str, attachments: list = None) -> None:
+    """
+    Saves a chat message. Attachments are stored as JSONB (list of dicts with
+    s3_key, display_name, mime_type) — no Gemini URIs which expire.
+    """
+    import json
+    attachments_json = json.dumps(attachments) if attachments else None
     sql = """
-        INSERT INTO chat_messages (session_id, role, content)
-        VALUES (%s::uuid, %s, %s);
+        INSERT INTO chat_messages (session_id, role, content, attachments)
+        VALUES (%s::uuid, %s, %s, %s::jsonb);
     """
     async with get_connection() as cur:
-        await cur.execute(sql, (session_id, role, content))
+        await cur.execute(sql, (session_id, role, content, attachments_json))
         # Also touch the session
         await cur.execute("UPDATE chat_sessions SET updated_at = NOW() WHERE id = %s::uuid;", (session_id,))
 
@@ -445,7 +451,7 @@ async def insert_message(session_id: str, role: str, content: str) -> None:
 async def get_session_messages(session_id: str, limit: int = 10) -> List[Dict[str, Any]]:
     """Fetches the last N messages for a session, ordered chronologically."""
     sql = """
-        SELECT id, role, content, created_at
+        SELECT id, role, content, attachments, created_at
         FROM chat_messages
         WHERE session_id = %s::uuid
         ORDER BY created_at DESC
@@ -462,6 +468,7 @@ async def get_session_messages(session_id: str, limit: int = 10) -> List[Dict[st
             "id": str(row["id"]),
             "role": row["role"],
             "content": row["content"],
+            "attachments": row.get("attachments") or None,
             "created_at": row["created_at"].isoformat()
         })
     return result

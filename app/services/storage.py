@@ -78,3 +78,35 @@ async def download_file_from_s3(s3_key: str) -> Optional[str]:
     except Exception as e:
         logger.error(f"Failed to download from S3/R2: {e}")
         return None
+
+
+async def generate_presigned_url(s3_key: str, expires_in: int = 3600) -> Optional[str]:
+    """
+    Generates a presigned URL for a file in S3/R2.
+    The URL is time-limited (default: 1 hour) — safe to expose to the frontend.
+    Returns None if S3 is not configured or generation fails.
+    """
+    if not is_s3_configured():
+        return None
+
+    try:
+        session = aioboto3.Session()
+        async with session.client(
+            's3',
+            endpoint_url=settings.S3_ENDPOINT_URL,
+            aws_access_key_id=settings.S3_ACCESS_KEY_ID,
+            aws_secret_access_key=settings.S3_SECRET_ACCESS_KEY,
+            region_name="auto"
+        ) as s3:
+            url = await s3.generate_presigned_url(
+                'get_object',
+                Params={
+                    'Bucket': settings.S3_BUCKET_NAME,
+                    'Key': s3_key,
+                },
+                ExpiresIn=expires_in,
+            )
+            return url
+    except Exception as e:
+        logger.error(f"Failed to generate presigned URL for {s3_key}: {e}")
+        return None

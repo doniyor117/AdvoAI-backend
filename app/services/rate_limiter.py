@@ -59,8 +59,8 @@ async def check_rate_limit(
         # Atomic increment — get new count after insert/update
         new_count = await increment_usage(user["id"])
 
-        # If user is admin, they have no limits, so just return
-        if user.get("role") == "admin":
+        # If user is admin or root_admin, they have no limits, so just return
+        if user.get("role") in ("admin", "root_admin"):
             return user
 
         free_daily_limit = await _get_dynamic_limit("free_daily_limit", settings.FREE_DAILY_LIMIT)
@@ -116,7 +116,7 @@ async def check_upload_limit(
         if user.get("is_banned"):
             raise HTTPException(status_code=403, detail="Your account has been suspended.")
         
-        if user.get("role") == "admin":
+        if user.get("role") in ("admin", "root_admin"):
             return
             
         new_count = await increment_upload_usage(user["id"], upload_type)

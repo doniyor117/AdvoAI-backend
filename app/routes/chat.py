@@ -376,22 +376,17 @@ async def ask_advoai(
                 "parent_documents": []
             }
         elif not is_conversational:
-            # If user has attached files, skip RAG injection entirely.
-            # The attachment IS the context — combining both risks token overflow.
-            if request.attachments:
-                logger.info("Attachments present — skipping RAG retrieval to avoid token overflow.")
-                rag_result = {
-                    "context_markdown": "",
-                    "parent_documents": [],
-                }
-            else:
-                rag_result = await retrieve_context(
-                    question=search_query,
-                    top_k=ideal_top_k,
-                )
+            # We always run RAG if it's not conversational, even with attachments!
+            # Gemini 1.5 has a massive context window, so token overflow is not a concern.
+            rag_result = await retrieve_context(
+                question=search_query,
+                top_k=ideal_top_k,
+            )
 
-                # Guard: no documents found and no URL context
-                if not rag_result.get("parent_documents") and not url_contexts:
+            # Guard: no documents found and no URL context
+            if not rag_result.get("parent_documents") and not url_contexts:
+                # If there are attachments, we still want the LLM to process them!
+                if not request.attachments:
                     return {
                         "answer": "I couldn't find any relevant legal documents in my database to answer this question. Please try rephrasing or asking about a different topic.",
                         "sources": [],

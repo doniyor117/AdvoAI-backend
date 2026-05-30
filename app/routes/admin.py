@@ -70,6 +70,7 @@ class UpdateSettingsRequest(BaseModel):
     custom_api_keys: Optional[str] = None
     global_notification: Optional[str] = None
     global_notification_type: Optional[str] = None
+    ui_support_email: Optional[str] = None
 
 
 class UpdateDocumentMetadataRequest(BaseModel):
@@ -188,6 +189,9 @@ async def update_settings(request: UpdateSettingsRequest, user=Depends(require_a
     if request.global_notification_type is not None:
         await update_setting("global_notification_type", request.global_notification_type)
         updated.append("global_notification_type")
+    if request.ui_support_email is not None:
+        await update_setting("ui_support_email", request.ui_support_email)
+        updated.append("ui_support_email")
 
     return {"message": f"Updated: {', '.join(updated)}", "settings": await get_all_settings()}
 

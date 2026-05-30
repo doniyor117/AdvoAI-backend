@@ -277,15 +277,40 @@ async def logout(response: Response):
 
 
 @router.get("/me")
-async def get_me(request: Request):
+async def get_me(request: Request, response: Response):
     """
     Returns the current authenticated user's profile.
+    If the JWT token role is stale compared to the DB, it reissues the token.
     """
     user = await get_current_user(request)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated.")
 
-    return {"user": _user_to_response(user)}
+    # Check if the token role matches the DB role, and reissue if not
+    token = request.cookies.get("advoai_token")
+    new_token = None
+    if token:
+        from app.middleware import decode_access_token, create_access_token
+        from datetime import timedelta
+        payload = decode_access_token(token)
+        if payload and payload.get("role") != user.get("role"):
+            new_token = create_access_token({
+                "sub": str(user["id"]),
+                "role": user.get("role", "free")
+            })
+            response.set_cookie(
+                key="advoai_token",
+                value=new_token,
+                httponly=True,
+                secure=True,
+                samesite="lax",
+                max_age=timedelta(days=7).total_seconds()
+            )
+
+    resp_data = {"user": _user_to_response(user)}
+    if new_token:
+        resp_data["token"] = new_token
+    return resp_data
 
 
 class UpdateProfileRequest(BaseModel):

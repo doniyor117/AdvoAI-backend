@@ -18,12 +18,15 @@ Supported conversions:
   text/csv            → Markdown table
 """
 
+import ipaddress
 import logging
 import asyncio
+import socket
 import tempfile
 import os
 import httpx
 from typing import Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -88,13 +91,41 @@ async def convert_to_markdown(file_path: str, mime_type: str, display_name: str 
         )
 
 
+def _is_safe_public_url(url: str) -> bool:
+    """Returns True only for http/https URLs that resolve to a public routable IP."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = parsed.hostname
+    if not host:
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return False
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            return False
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return False
+    return True
+
+
 async def fetch_and_convert_url(url: str) -> Optional[str]:
     """
     Fetches a URL and converts it to Markdown.
+    Only fetches URLs that resolve to public, non-private IPs (SSRF guard).
     """
+    if not _is_safe_public_url(url):
+        logger.warning(f"Blocked URL fetch (SSRF guard): {url}")
+        return None
     logger.info(f"Implicitly scraping URL: {url}")
     try:
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
             response = await client.get(
                 url, 
                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}

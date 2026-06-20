@@ -136,12 +136,15 @@ async def update_settings(request: UpdateSettingsRequest, user=Depends(require_a
             detail=f"Root admin required to modify: {', '.join(root_only_requested)}."
         )
 
+    _llm_settings_changed = False
     if request.current_llm_model is not None:
         await update_setting("current_llm_model", request.current_llm_model)
         updated.append("current_llm_model")
+        _llm_settings_changed = True
     if request.current_router_model is not None:
         await update_setting("current_router_model", request.current_router_model)
         updated.append("current_router_model")
+        _llm_settings_changed = True
     if request.custom_api_keys is not None:
         await update_setting("custom_api_keys", request.custom_api_keys)
         updated.append("custom_api_keys")
@@ -170,12 +173,15 @@ async def update_settings(request: UpdateSettingsRequest, user=Depends(require_a
     if request.custom_main_prompt is not None:
         await update_setting("custom_main_prompt", request.custom_main_prompt)
         updated.append("custom_main_prompt")
+        _llm_settings_changed = True
     if request.custom_router_prompt is not None:
         await update_setting("custom_router_prompt", request.custom_router_prompt)
         updated.append("custom_router_prompt")
+        _llm_settings_changed = True
     if request.override_prompts_enabled is not None:
         await update_setting("override_prompts_enabled", "true" if request.override_prompts_enabled else "false")
         updated.append("override_prompts_enabled")
+        _llm_settings_changed = True
     if request.rag_top_k is not None:
         await update_setting("rag_top_k", str(request.rag_top_k))
         updated.append("rag_top_k")
@@ -192,6 +198,10 @@ async def update_settings(request: UpdateSettingsRequest, user=Depends(require_a
     if request.ui_support_email is not None:
         await update_setting("ui_support_email", request.ui_support_email)
         updated.append("ui_support_email")
+
+    if _llm_settings_changed:
+        from app.services.llm_client import reset_llm_client
+        reset_llm_client()
 
     return {"message": f"Updated: {', '.join(updated)}", "settings": await get_all_settings()}
 
@@ -230,7 +240,10 @@ async def change_user_role(user_id: str, request: UpdateRoleRequest, user=Depend
         raise HTTPException(status_code=403, detail="Only root admins can modify admin accounts.")
 
     try:
-        admin_password_hash = _hash_password(request.admin_password) if request.admin_password else None
+        # Only set admin_password when promoting to admin — never on demotion or other role changes
+        admin_password_hash = None
+        if request.role == "admin" and request.admin_password:
+            admin_password_hash = _hash_password(request.admin_password)
         await update_user_role(user_id, request.role, admin_password_hash)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

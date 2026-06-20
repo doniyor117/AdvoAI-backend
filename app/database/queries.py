@@ -6,42 +6,13 @@ Rows returned as dicts via RealDictCursor (configured in connection.py).
 """
 import json
 import logging
-import re
+import time
 from typing import Dict, List, Any, Optional
 from datetime import datetime
 
-from app.database.connection import get_connection, AsyncCursor
+from app.database.connection import get_connection, get_transaction, AsyncCursor
 
 logger = logging.getLogger(__name__)
-
-
-def _adapt_sql(sql: str, params: Any = None) -> tuple[str, list]:
-    if params is None:
-        return sql, []
-    
-    if isinstance(params, dict):
-        args = []
-        def repl(m):
-            key = m.group(1)
-            if key not in params:
-                raise KeyError(f"Missing parameter {key}")
-            args.append(params[key])
-            return f"${len(args)}"
-        new_sql = re.sub(r"%\(([^)]+)\)s", repl, sql)
-        return new_sql, args
-    elif isinstance(params, (list, tuple)):
-        args = list(params)
-        # replace %s with $1, $2, etc.
-        def repl(m):
-            if not hasattr(repl, "count"):
-                repl.count = 0
-            repl.count += 1
-            return f"${repl.count}"
-        new_sql = re.sub(r"%s", repl, sql)
-        return new_sql, args
-    else:
-        return sql, [params]
-
 
 
 
@@ -135,6 +106,67 @@ async def insert_chunks(chunks: List[Dict[str, Any]]) -> None:
             })
 
     logger.info(f"{len(chunks)} chunks saved to database.")
+
+
+async def ingest_document_atomic(
+    document: Dict[str, Any],
+    parts: List[Dict[str, Any]],
+    chunks: List[Dict[str, Any]],
+) -> None:
+    """
+    Inserts document + parts + chunks in a single transaction.
+    Rolls back entirely if any insert fails, preventing orphaned documents.
+    """
+    doc_sql = """
+        INSERT INTO documents (
+            id, source_doc_id, title, act_type,
+            doc_date, source_url, category, is_active
+        )
+        VALUES (
+            %(id)s, %(source_doc_id)s, %(title)s, %(act_type)s,
+            %(doc_date)s, %(source_url)s, %(category)s, %(is_active)s
+        );
+    """
+    part_sql = """
+        INSERT INTO document_parts (id, document_id, part_title, text, part_index)
+        VALUES (%(id)s, %(document_id)s, %(part_title)s, %(text)s, %(part_index)s);
+    """
+    chunk_sql = """
+        INSERT INTO chunks (id, document_part_id, text, embedding, chunk_metadata)
+        VALUES (%(id)s, %(document_part_id)s, %(text)s, %(embedding)s, %(chunk_metadata)s);
+    """
+
+    chunk_params = [
+        {
+            "id": c["id"],
+            "document_part_id": c["document_part_id"],
+            "text": c["text"],
+            "embedding": c.get("embedding"),
+            "chunk_metadata": json.dumps(c.get("chunk_metadata", {})),
+        }
+        for c in chunks
+    ]
+
+    async with get_transaction() as cur:
+        await cur.execute(doc_sql, document)
+        if parts:
+            await cur.executemany(part_sql, [
+                {
+                    "id": p["id"],
+                    "document_id": p["document_id"],
+                    "part_title": p["part_title"],
+                    "text": p["text"],
+                    "part_index": p.get("part_index", 0),
+                }
+                for p in parts
+            ])
+        if chunk_params:
+            await cur.executemany(chunk_sql, chunk_params)
+
+    logger.info(
+        f"Atomic ingest complete: doc={document['source_doc_id']} "
+        f"parts={len(parts)} chunks={len(chunks)}"
+    )
 
 
 # ── RAG Retrieval Queries ─────────────────────────────────────
@@ -867,11 +899,22 @@ async def get_all_settings() -> Dict[str, str]:
     return {r["key"]: r["value"] for r in rows}
 
 
+_settings_cache: Dict[str, tuple] = {}  # key → (value, expires_at)
+_SETTINGS_TTL = 45  # seconds
+
+
 async def get_setting(key: str) -> Optional[str]:
+    now = time.monotonic()
+    if key in _settings_cache:
+        value, expires_at = _settings_cache[key]
+        if now < expires_at:
+            return value
     async with get_connection() as cur:
         await cur.execute("SELECT value FROM system_settings WHERE key = %s;", (key,))
         row = cur.fetchone()
-    return row["value"] if row else None
+    value = row["value"] if row else None
+    _settings_cache[key] = (value, now + _SETTINGS_TTL)
+    return value
 
 
 async def update_setting(key: str, value: str) -> None:
@@ -881,6 +924,8 @@ async def update_setting(key: str, value: str) -> None:
     """
     async with get_connection() as cur:
         await cur.execute(sql, (key, value))
+    # Invalidate cached value so the next read is fresh
+    _settings_cache.pop(key, None)
 
 
 # ── Document Management Queries (Admin) ──────────────────────

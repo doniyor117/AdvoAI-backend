@@ -66,11 +66,6 @@ class ApiKeyManager:
                 
             return self._clients[self.keys[self.active_index]]
 
-    def reload_keys(self):
-        """Synchronously trigger reloading in a background task or handle via next request?
-        Actually, let's make reload_keys an async method."""
-        pass
-
     async def async_reload_keys(self):
         """Reloads API keys from the database or settings."""
         from app.database.queries import get_setting

@@ -107,15 +107,10 @@ async def require_admin(request: Request) -> Dict[str, Any]:
 async def require_root_admin(request: Request) -> Dict[str, Any]:
     """
     Dependency that REQUIRES a root_admin user.
-    Root admins are the only accounts that can perform destructive or
-    security-sensitive operations (deleting documents, bulk ingestion,
-    promoting users, changing LLM models, modifying API keys).
     Root admin accounts can only be assigned directly in the database.
     Raises 403 if user is not root_admin.
     """
     user = await require_auth(request)
-    if user.get("role") not in ("admin", "root_admin"):
-        raise HTTPException(status_code=403, detail="Admin access required.")
     if user.get("role") != "root_admin":
         raise HTTPException(
             status_code=403,

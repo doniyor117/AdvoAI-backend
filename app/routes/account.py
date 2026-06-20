@@ -7,7 +7,7 @@ import logging
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, EmailStr, Field
 
-from app.middleware import get_current_user
+from app.middleware import require_auth
 from app.database.queries import (
     get_user_by_id, get_user_by_email, get_user_by_google_id,
     create_verification_code, get_verification_code, delete_verification_codes_by_email,
@@ -57,7 +57,7 @@ class LinkGoogleRequest(BaseModel):
 # ── Routes ───────────────────────────────────────────────────
 
 @router.post("/update-password")
-async def update_password(request: UpdatePasswordRequest, user=Depends(get_current_user)):
+async def update_password(request: UpdatePasswordRequest, user=Depends(require_auth)):
     """Update password for authenticated user."""
     db_user = await get_user_by_id(user["id"])
     if not db_user:
@@ -75,7 +75,7 @@ async def update_password(request: UpdatePasswordRequest, user=Depends(get_curre
 
 
 @router.post("/update-admin-password")
-async def update_admin_password(request: UpdateAdminPasswordRequest, user=Depends(get_current_user)):
+async def update_admin_password(request: UpdateAdminPasswordRequest, user=Depends(require_auth)):
     """Updates a user's admin password."""
     if user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Only admins can have admin passwords.")
@@ -96,7 +96,7 @@ async def update_admin_password(request: UpdateAdminPasswordRequest, user=Depend
     return {"message": "Admin password updated successfully"}
 
 @router.post("/update-privacy")
-async def update_privacy(request: UpdatePrivacyRequest, user=Depends(get_current_user)):
+async def update_privacy(request: UpdatePrivacyRequest, user=Depends(require_auth)):
     """Updates privacy settings."""
     async with get_connection() as cur:
         await cur.execute(
@@ -141,7 +141,7 @@ async def reset_password(request: ResetPasswordRequest):
 
 
 @router.post("/request-email-change")
-async def request_email_change(request: RequestEmailChangeRequest, user=Depends(get_current_user)):
+async def request_email_change(request: RequestEmailChangeRequest, user=Depends(require_auth)):
     """Sends OTP to the *new* email address to verify it."""
     # Check if the new email is already in use
     existing = await get_user_by_email(request.new_email)
@@ -159,7 +159,7 @@ async def request_email_change(request: RequestEmailChangeRequest, user=Depends(
 
 
 @router.post("/verify-email-change")
-async def verify_email_change(request: VerifyEmailChangeRequest, user=Depends(get_current_user)):
+async def verify_email_change(request: VerifyEmailChangeRequest, user=Depends(require_auth)):
     """Verifies OTP and changes the user's email."""
     code_record = await get_verification_code(request.new_email, request.otp, "email_change")
     if not code_record or str(code_record["user_id"]) != str(user["id"]):
@@ -177,7 +177,7 @@ async def verify_email_change(request: VerifyEmailChangeRequest, user=Depends(ge
 
 
 @router.post("/link-google")
-async def link_google(request: LinkGoogleRequest, user=Depends(get_current_user)):
+async def link_google(request: LinkGoogleRequest, user=Depends(require_auth)):
     """Links a Google account using the Google ID Token."""
     from google.oauth2 import id_token
     from google.auth.transport import requests
@@ -201,7 +201,7 @@ async def link_google(request: LinkGoogleRequest, user=Depends(get_current_user)
 
 
 @router.post("/unlink-google")
-async def unlink_google(user=Depends(get_current_user)):
+async def unlink_google(user=Depends(require_auth)):
     """Unlinks a Google account. Requires a password to be set."""
     db_user = await get_user_by_id(user["id"])
     if not db_user:

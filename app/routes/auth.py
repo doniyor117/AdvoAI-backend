@@ -14,7 +14,7 @@ from pydantic import BaseModel, EmailStr, Field
 import bcrypt
 
 from app.config import settings
-from app.middleware import create_access_token, get_current_user
+from app.middleware import create_access_token, get_current_user, require_auth
 from app.services.email import generate_otp, get_otp_expiry, send_registration_otp
 from app.database.queries import (
     create_user, get_user_by_email, get_user_by_google_id,
@@ -177,7 +177,7 @@ class ConsentRequest(BaseModel):
     allow_data_collection: bool
 
 @router.post("/submit-consent")
-async def submit_consent(request: ConsentRequest, current_user=Depends(get_current_user)):
+async def submit_consent(request: ConsentRequest, current_user=Depends(require_auth)):
     """
     Submits user consent for Terms of Service and Data Collection.
     Primarily used during the Google SSO consent gate.

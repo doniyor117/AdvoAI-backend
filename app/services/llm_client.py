@@ -318,16 +318,31 @@ class GeminiClient:
 
 _llm_client_instance = None
 
+
+def reset_llm_client() -> None:
+    """Invalidates the cached singleton so next call to get_llm_client() rebuilds it."""
+    global _llm_client_instance
+    _llm_client_instance = None
+
+
 async def get_llm_client() -> GeminiClient:
-    """Returns a cached singleton GeminiClient based on system settings."""
+    """Returns a cached singleton GeminiClient based on current system settings."""
     global _llm_client_instance
     if _llm_client_instance is not None:
         return _llm_client_instance
 
     from app.database.queries import get_setting
-    # Allow fallback if setting doesn't exist
-    main_model = await get_setting("current_llm_model") or "gemini-3.1-flash-lite"
+    main_model   = await get_setting("current_llm_model")   or "gemini-3.1-flash-lite"
     router_model = await get_setting("current_router_model") or "gemma-4-31b-it"
-    
-    _llm_client_instance = GeminiClient(main_model=main_model, router_model=router_model)
+
+    override = (await get_setting("override_prompts_enabled") or "").lower() == "true"
+    custom_main_prompt   = (await get_setting("custom_main_prompt"))   if override else None
+    custom_router_prompt = (await get_setting("custom_router_prompt")) if override else None
+
+    _llm_client_instance = GeminiClient(
+        main_model=main_model,
+        router_model=router_model,
+        custom_main_prompt=custom_main_prompt or None,
+        custom_router_prompt=custom_router_prompt or None,
+    )
     return _llm_client_instance

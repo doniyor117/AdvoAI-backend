@@ -16,7 +16,7 @@ from app.ingestion.lex_parser import LexParser
 from app.ingestion.chunker import LegalUnstructuredChunker
 from app.services.embedder import get_embedder
 from app.services.llm_client import get_llm_client
-from app.database.queries import check_duplicate, insert_document, insert_document_parts, insert_chunks
+from app.database.queries import check_duplicate, insert_document, insert_document_parts, insert_chunks, ingest_document_atomic
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -168,12 +168,10 @@ async def process_and_ingest_law(url: str, skip_db: bool = False, category: str 
     # Note: passing doc_title helps gemini embeddings contextualize the chunk
     all_search_chunks = await embedder.embed_chunks(all_search_chunks, doc_title=doc_title)
 
-    # Step 7: Save to database
+    # Step 7: Save to database (all three writes in one atomic transaction)
     if not skip_db:
-        logger.info("Saving to database...")
-        await insert_document(root_document_record)
-        await insert_document_parts(document_parts)
-        await insert_chunks(all_search_chunks)
+        logger.info("Saving to database (atomic)...")
+        await ingest_document_atomic(root_document_record, document_parts, all_search_chunks)
     else:
         logger.info("Skipping DB writes (skip_db=True)")
 

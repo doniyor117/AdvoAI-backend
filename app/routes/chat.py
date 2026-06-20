@@ -121,7 +121,7 @@ async def _background_history_maintenance(
     """
     try:
         # Check sliding window size
-        MAX_WINDOW_MESSAGES = 40
+        MAX_WINDOW_MESSAGES = 10
         current_messages = await get_session_messages(session_id, limit=100)
         
         if len(current_messages) > MAX_WINDOW_MESSAGES:
@@ -194,25 +194,34 @@ async def upload_file(
         upload_type = "image" if is_image else "doc"
         await check_upload_limit(request, user, upload_type)
 
-        # ── 2. Read and validate size ────────────────────────
-        content = await file.read()
-        if len(content) > MAX_FILE_BYTES:
-            raise HTTPException(
-                status_code=413,
-                detail=f"File too large ({len(content) // (1024*1024)}MB). Maximum allowed size is {MAX_FILE_SIZE_MB}MB."
-            )
-
+        # ── 2. Stream to temp file and validate size ────────
         display_name = file.filename or "uploaded_file"
-        logger.info(f"Processing upload: '{display_name}' ({base_mime}, {len(content):,} bytes)")
-
-        # ── 3. Save original to temp file ───────────────────
-        def _save(data: bytes, suffix: str) -> str:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                tmp.write(data)
-                return tmp.name
-
         ext = os.path.splitext(display_name)[1] or ".bin"
-        original_tmp_path = await asyncio.to_thread(_save, content, ext)
+
+        CHUNK = 1024 * 1024  # 1 MB
+
+        def _open_tmp(suffix: str) -> str:
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            tmp.close()
+            return tmp.name
+
+        original_tmp_path = await asyncio.to_thread(_open_tmp, ext)
+
+        total = 0
+        with open(original_tmp_path, "wb") as fout:
+            while True:
+                chunk = await file.read(CHUNK)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_FILE_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File too large. Maximum allowed size is {MAX_FILE_SIZE_MB}MB."
+                    )
+                fout.write(chunk)
+
+        logger.info(f"Processing upload: '{display_name}' ({base_mime}, {total:,} bytes)")
 
         # ── 4. Convert if needed (MarkItDown) ───────────────
         upload_path = original_tmp_path
@@ -454,7 +463,25 @@ async def ask_advoai(
                                 except Exception:
                                     pass
 
-        # ── 5. Generate answer with Main LLM ────────────────
+        # ── 5a. Pre-save user message so reloads show it mid-processing ──
+        attachment_meta = None
+        if session_id:
+            try:
+                if request.attachments:
+                    attachment_meta = [
+                        {
+                            "s3_key": att.s3_key,
+                            "display_name": att.display_name,
+                            "mime_type": att.mime_type,
+                        }
+                        for att in request.attachments
+                        if att.s3_key
+                    ] or None
+                await insert_message(session_id, "user", request.question, attachments=attachment_meta)
+            except Exception as se:
+                logger.warning(f"Pre-save user message failed (non-fatal): {se}")
+
+        # ── 5b. Generate answer with Main LLM ───────────────
         llm_time_ms = None
         try:
             start_llm = time.monotonic()
@@ -483,25 +510,9 @@ async def ask_advoai(
                 )
             raise
 
-        # ── 5. Update Hybrid History (Archive Shift) ────────
+        # ── 5c. Save assistant reply & run history maintenance ─
         if session_id:
             try:
-                # Save the new exchange to sliding window.
-                # Only save s3_key + display_name + mime_type for attachments—
-                # Gemini URIs expire, so they're not worth persisting.
-                attachment_meta = None
-                if request.attachments:
-                    attachment_meta = [
-                        {
-                            "s3_key": att.s3_key,
-                            "display_name": att.display_name,
-                            "mime_type": att.mime_type,
-                        }
-                        for att in request.attachments
-                        if att.s3_key  # Only persist if actually in R2
-                    ] or None
-
-                await insert_message(session_id, "user", request.question, attachments=attachment_meta)
                 await insert_message(session_id, "assistant", llm_result["answer"])
 
                 # Check sliding window size and summarize in background

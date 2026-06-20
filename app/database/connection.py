@@ -15,6 +15,7 @@ Usage:
 """
 
 import logging
+import re
 from contextlib import asynccontextmanager
 
 import asyncpg
@@ -43,13 +44,14 @@ async def init_pool() -> None:
         dsn=settings.DATABASE_URL,
         min_size=2,
         max_size=10,
-        init=init_connection
+        init=init_connection,
+        # Close connections idle for >4 min to prevent stale-connection errors when
+        # Postgres drops them from its side (default tcp keepalive is often 5 min).
+        max_inactive_connection_lifetime=240,
     )
 
     logger.info("Database pool initialized. pgvector async extension verified.")
 
-
-import re
 
 async def close_pool() -> None:
     """
@@ -97,16 +99,30 @@ class AsyncCursor:
     async def execute(self, sql: str, params=None):
         new_sql, args = _adapt_sql(sql, params)
         self._last_result = await self.conn.fetch(new_sql, *args)
-    
+
+    async def executemany(self, sql: str, params_list):
+        """Batch-executes a parameterized statement for each item in params_list."""
+        if not params_list:
+            return
+        # Derive positional SQL from the first row's params
+        new_sql, _ = _adapt_sql(sql, params_list[0])
+        # Build positional arg tuples for each row
+        args_list = []
+        for params in params_list:
+            _, args = _adapt_sql(sql, params)
+            args_list.append(args)
+        await self.conn.executemany(new_sql, args_list)
+
     def fetchone(self):
         if self._last_result:
             return dict(self._last_result[0])
         return None
-        
+
     def fetchall(self):
         if self._last_result:
             return [dict(r) for r in self._last_result]
         return []
+
 
 @asynccontextmanager
 async def get_connection():
@@ -122,6 +138,23 @@ async def get_connection():
 
     async with _pool.acquire() as conn:
         yield AsyncCursor(conn)
+
+
+@asynccontextmanager
+async def get_transaction():
+    """
+    Like get_connection() but wraps the entire body in a single DB transaction.
+    Any exception causes an automatic rollback.
+    """
+    if _pool is None:
+        raise RuntimeError(
+            "Database pool is not initialized. "
+            "Ensure await init_pool() is called at application startup."
+        )
+
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            yield AsyncCursor(conn)
 
 # ── Quick test ────────────────────────────────────────────────
 if __name__ == "__main__":

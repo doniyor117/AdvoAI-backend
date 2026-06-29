@@ -23,8 +23,12 @@ unstructured
 google-genai
 
 # ── API & Web Server ─────────────────────────────────────────
-fastapi
-uvicorn
+# PINNED: unpinned versions let Hugging Face rebuilds drift to a Starlette
+# whose CORS preflight omits Access-Control-Allow-Credentials, which breaks
+# all credentialed POST requests (login, chat) from the browser. Do not unpin.
+fastapi==0.136.3
+starlette==1.1.0
+uvicorn==0.48.0
 pydantic-settings
 python-multipart
 

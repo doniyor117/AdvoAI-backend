@@ -11,8 +11,7 @@ Usage:
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
 from app.config import settings
@@ -53,20 +52,46 @@ app = FastAPI(
 )
 
 # ── CORS ──────────────────────────────────────────────────────
+# Hand-rolled CORS instead of Starlette's CORSMiddleware: some Starlette
+# versions omit `Access-Control-Allow-Credentials: true` on the OPTIONS
+# preflight response, which silently breaks every credentialed POST (login,
+# chat) from the browser. Handling it here guarantees the header is present on
+# both preflight and normal responses, independent of the installed version.
 
-_ALLOWED_ORIGINS = [
+_ALLOWED_ORIGINS = {
     origin.strip()
     for origin in settings.CORS_ORIGINS.split(",")
     if origin.strip()
-]
+}
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+def _apply_cors_headers(resp: Response, origin: str, request: Request) -> None:
+    resp.headers["Access-Control-Allow-Origin"] = origin
+    resp.headers["Access-Control-Allow-Credentials"] = "true"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+    requested = request.headers.get("access-control-request-headers")
+    resp.headers["Access-Control-Allow-Headers"] = requested or "*"
+    resp.headers["Access-Control-Expose-Headers"] = "*"
+    resp.headers["Access-Control-Max-Age"] = "600"
+    resp.headers["Vary"] = "Origin"
+
+
+@app.middleware("http")
+async def cors_middleware(request: Request, call_next):
+    origin = request.headers.get("origin")
+    is_allowed = origin is not None and origin in _ALLOWED_ORIGINS
+
+    # Short-circuit the preflight so the credentials header is always present.
+    if request.method == "OPTIONS" and origin is not None:
+        resp = Response(status_code=200 if is_allowed else 400)
+        if is_allowed:
+            _apply_cors_headers(resp, origin, request)
+        return resp
+
+    response = await call_next(request)
+    if is_allowed:
+        _apply_cors_headers(response, origin, request)
+    return response
 
 # ── Global Exception Handler ──────────────────────────────────
 

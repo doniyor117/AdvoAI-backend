@@ -204,11 +204,15 @@ async def fetch_document_parts(part_ids: List[str]) -> List[Dict[str, Any]]:
         return []
 
     sql = """
-        SELECT dp.id AS part_id, dp.text AS full_markdown, dp.part_title AS title, 
-               d.source_doc_id, d.source_url, d.title AS root_title
+        SELECT dp.id AS part_id, dp.text AS full_markdown, dp.part_title AS title,
+               dp.part_index, d.source_doc_id, d.source_url, d.title AS root_title
         FROM document_parts dp
         JOIN documents d ON dp.document_id = d.id
-        WHERE dp.id = ANY(%s::uuid[]);
+        WHERE dp.id = ANY(%s::uuid[])
+        -- Deterministic order. Without it Postgres returned rows arbitrarily, and the
+        -- citation builder (which kept the first row per document) showed a RANDOM part
+        -- of the code — often not the one the answer was written from.
+        ORDER BY d.title, dp.part_index;
     """
     async with get_connection() as cur:
         await cur.execute(sql, (part_ids,))
@@ -220,6 +224,7 @@ async def fetch_document_parts(part_ids: List[str]) -> List[Dict[str, Any]]:
             "title": row["title"],
             "root_title": row["root_title"],
             "full_markdown": row["full_markdown"],
+            "part_index": row["part_index"],
             "source_doc_id": row["source_doc_id"],
             "source_url": row["source_url"],
         }

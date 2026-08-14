@@ -143,27 +143,56 @@ async def _rollback_user_message(message_id: Optional[str]) -> None:
         logger.warning(f"Could not roll back pre-saved user message {message_id}")
 
 
-def safe_citations_for_storage(rag_result: dict, is_conversational: bool) -> list:
-    """Citation metadata for the `sources` column.
+def _citation_label(doc: dict) -> str:
+    """Human label for a citation chip: the code's name, plus which part of it."""
+    root = doc.get("root_title") or "Untitled Document"
+    idx = doc.get("part_index")
+    # part_title is "{Title} (Part N)"; show the code name and the part number only,
+    # so the chip reads "Mehnat kodeksi — 3-qism" rather than repeating the full title.
+    if isinstance(idx, int) and idx > 0:
+        return f"{root} ({idx + 1})"
+    return root
 
-    Deliberately omits `text`: a parent document is 20k+ chars and there can be five
-    of them per answer, so persisting the bodies would bloat every row. Titles and
-    links are enough to re-render the citation chips after a reload.
-    """
+
+def _citation_url(doc: dict) -> str:
+    src = doc.get("source_url")
+    if src and src != "#":
+        return src
+    doc_id = doc.get("source_doc_id")
+    return f"https://lex.uz/docs/{doc_id}" if doc_id else "#"
+
+
+def _build_citations(rag_result: dict, is_conversational: bool) -> list:
+    """One entry per matched document part, deduplicated by part id."""
     if is_conversational:
         return []
     seen, out = set(), []
     for doc in rag_result.get("parent_documents", []):
-        doc_id = doc.get("source_doc_id")
-        if doc_id in seen:
+        part_id = doc.get("id")
+        if part_id in seen:
             continue
-        seen.add(doc_id)
+        seen.add(part_id)
         out.append({
-            "id": doc_id,
-            "title": doc.get("root_title", "Untitled Document"),
-            "source_url": doc.get("source_url", "#"),
+            "id": doc.get("source_doc_id"),
+            "part_id": part_id,
+            "title": _citation_label(doc),
+            "source_url": _citation_url(doc),
+            "text": doc.get("full_markdown") or "",
         })
     return out
+
+
+def safe_citations_for_storage(rag_result: dict, is_conversational: bool) -> list:
+    """Citation metadata for the `sources` column.
+
+    Same shape as the live citations so a reloaded chat renders identically, minus
+    `text`: a part is 20k+ chars and there can be several per answer, so persisting
+    the bodies would bloat every row.
+    """
+    return [
+        {k: v for k, v in cit.items() if k != "text"}
+        for cit in _build_citations(rag_result, is_conversational)
+    ]
 
 
 def _read_text_file(path: str) -> str:
@@ -533,21 +562,29 @@ async def ask_advoai(
         # it the actual text so it can classify and build a search query from the subject
         # matter of the document.
         document_excerpts = []
+        router_media_parts = []
         if document_ids:
             try:
+                from app.services.attachments import build_parts
+                media_ids = []
                 for doc in await get_uploaded_documents(document_ids):
                     if doc.get("extracted_text"):
                         document_excerpts.append({
                             "display_name": doc["display_name"],
                             "text": doc["extracted_text"],
                         })
+                    elif doc.get("kind") == "media":
+                        media_ids.append(doc["id"])
+                # Images and PDFs carry no extracted text, so give the router the file
+                # itself rather than a bare count — otherwise "is this legal?" over a
+                # scanned contract misroutes exactly as .docx used to.
+                if media_ids:
+                    router_media_parts = await build_parts(client, media_ids)
             except Exception:
-                logger.exception("Could not load document excerpts for routing; routing on text alone")
+                logger.exception("Could not load attachments for routing; routing on text alone")
 
         router_question = request.question
-        if request.attachments and not document_excerpts:
-            # Images and PDFs have no extracted text — fall back to the old hint so the
-            # router at least knows something is attached.
+        if request.attachments and not document_excerpts and not router_media_parts:
             router_question += f" [User attached {len(request.attachments)} file(s)]"
 
         import time
@@ -556,6 +593,7 @@ async def ask_advoai(
             router_question,
             recent_messages=recent_messages if session_id else None,
             document_excerpts=document_excerpts,
+            media_parts=router_media_parts,
         )
         router_time_ms = int((time.monotonic() - start_router) * 1000)
         
@@ -783,21 +821,12 @@ async def ask_advoai(
         )
 
         # ── 6. Format response for frontend ─────────────────
-        safe_citations = []
-        if not is_conversational:
-            seen_doc_ids = set()
-            for doc in rag_result.get("parent_documents", []):
-                # doc contains 'source_doc_id', 'title', 'root_title', 'full_markdown'
-                doc_id = doc.get("source_doc_id")
-                if doc_id in seen_doc_ids:
-                    continue
-                seen_doc_ids.add(doc_id)
-                safe_citations.append({
-                    "id": doc_id,
-                    "title": doc.get("root_title", "Untitled Document"),
-                    "source_url": doc.get("source_url", "#"),
-                    "text": doc.get("full_markdown") or "", 
-                })
+        # One citation per matched PART, not per document. Deduplicating by
+        # source_doc_id meant three matched parts of the Labour Code collapsed into a
+        # single chip showing whichever row Postgres happened to return first — so the
+        # panel often displayed a section the answer never used, and the other two
+        # genuinely-cited passages were dropped silently.
+        safe_citations = _build_citations(rag_result, is_conversational)
 
         return {
             "answer": llm_result["answer"],

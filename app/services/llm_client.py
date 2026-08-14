@@ -137,6 +137,7 @@ class GeminiClient:
         question: str,
         recent_messages: list = None,
         document_excerpts: list = None,
+        media_parts: list = None,
     ) -> Dict[str, str]:
         """
         Uses gemma-4-31b-it to classify the query as 'conversational' or 'legal_rag'.
@@ -179,12 +180,38 @@ class GeminiClient:
         sections.append(f"Current Query: {question}")
         prompt = "\n\n".join(sections) if len(sections) > 1 else question
 
+        # Images and PDFs have no extracted text, so the router would otherwise be blind
+        # to them and misroute "is this legal?" the same way it did for .docx. Pass the
+        # media natively. NOTE: the default router is gemma-4-31b-it, which may reject
+        # media parts — hence the text-only retry below rather than an assumption.
+        if media_parts:
+            try:
+                contents = [types.Content(
+                    role="user",
+                    parts=list(media_parts) + [types.Part.from_text(text=prompt)],
+                )]
+                response = await self._generate_with_retry(
+                    model=self.router_model, contents=contents, config=config,
+                )
+                return self._parse_routing(response, question)
+            except Exception as e:
+                logger.warning(
+                    f"Router model '{self.router_model}' could not accept media "
+                    f"({str(e)[:120]}); falling back to text-only routing."
+                )
+                prompt += f"\n\n[The user attached {len(media_parts)} image/PDF file(s). " \
+                          f"If they are asking anything about its legality, validity, or " \
+                          f"consequences, classify as legal_rag.]"
+
         response = await self._generate_with_retry(
             model=self.router_model,
             contents=prompt,
             config=config,
         )
-        
+        return self._parse_routing(response, question)
+
+    def _parse_routing(self, response: Any, question: str) -> Dict[str, str]:
+        """Extracts the routing JSON from a router response."""
         # Parse output safely, separating thoughts from the final response
         final_text = ""
         if response.candidates and response.candidates[0].content.parts:
@@ -192,27 +219,23 @@ class GeminiClient:
                 if getattr(part, 'thought', False):
                     logger.debug(f"[Gemma Thought]: {part.text}")
                 else:
-                    final_text += part.text
+                    final_text += part.text or ""
         else:
-            final_text = response.text
-            
+            final_text = response.text or ""
+
         final_text = final_text.strip()
         logger.debug(f"Router final text: {final_text}")
-        
-        # Extract JSON
+
         match = re.search(r"\{.*\}", final_text, re.DOTALL)
         if match:
             try:
                 data = json.loads(match.group(0))
                 intent = data.get("intent", "legal_rag")
                 search_query = data.get("search_query", "") if intent == "conversational" else data.get("search_query", question)
-
-                # ROUTER_SYSTEM_PROMPT explicitly asks for these two. Dropping them meant
-                # CONTRACT_TEMPLATES was unreachable and adaptive top-k never took effect.
                 routed = {"intent": intent, "search_query": search_query}
 
                 ideal_top_k = data.get("ideal_top_k")
-                if isinstance(ideal_top_k, (int, float)) or (isinstance(ideal_top_k, str) and ideal_top_k.isdigit()):
+                if isinstance(ideal_top_k, (int, float)) or (isinstance(ideal_top_k, str) and str(ideal_top_k).isdigit()):
                     routed["ideal_top_k"] = max(3, min(10, int(ideal_top_k)))
 
                 contract_type = data.get("contract_type")

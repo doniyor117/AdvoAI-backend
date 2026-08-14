@@ -17,8 +17,9 @@ client = TestClient(app)
 @patch('app.routes.chat.retrieve_context', new_callable=AsyncMock)
 @patch('app.routes.chat.get_session_by_id', new_callable=AsyncMock)
 @patch('app.routes.chat.get_session_messages', new_callable=AsyncMock)
+@patch('app.database.queries.get_setting', new_callable=AsyncMock)
 @patch('app.routes.chat.log_router_analytics', new_callable=AsyncMock)
-def test_ask_advoai_search_intent(mock_log, mock_get_messages, mock_get_session, mock_retrieve, mock_get_llm):
+def test_ask_advoai_search_intent(mock_log, mock_get_setting, mock_get_messages, mock_get_session, mock_retrieve, mock_get_llm):
     # Setup mocks
     mock_get_session.return_value = {"id": "session_123", "user_id": "test_user_id"}
     mock_get_messages.return_value = []
@@ -59,8 +60,9 @@ def test_ask_advoai_search_intent(mock_log, mock_get_messages, mock_get_session,
 @patch('app.routes.chat.get_llm_client', new_callable=AsyncMock)
 @patch('app.routes.chat.create_session', new_callable=AsyncMock)
 @patch('app.routes.chat.get_session_messages', new_callable=AsyncMock)
+@patch('app.database.queries.get_setting', new_callable=AsyncMock)
 @patch('app.routes.chat.log_router_analytics', new_callable=AsyncMock)
-def test_ask_advoai_conversational_intent(mock_log, mock_get_messages, mock_create_session, mock_get_llm):
+def test_ask_advoai_conversational_intent(mock_log, mock_get_setting, mock_get_messages, mock_create_session, mock_get_llm):
     # Setup mocks
     mock_create_session.return_value = {"id": "session_new", "user_id": "test_user_id"}
     mock_get_messages.return_value = []

@@ -16,7 +16,7 @@ from fastapi import APIRouter, HTTPException, Depends, Request, BackgroundTasks,
 from pydantic import BaseModel, Field
 
 from app.services.rag_pipeline import retrieve_context
-from app.services.llm_client import get_llm_client
+from app.services.llm_client import get_llm_client, EmptyLLMResponse
 from app.services.converter import (
     CONVERTIBLE_MIME_TYPES,
     convert_to_markdown,
@@ -29,7 +29,8 @@ from app.database.queries import (
     get_session_by_id, update_session_summary,
     create_session, rename_session,
     insert_message, get_session_messages, delete_oldest_message,
-    log_router_analytics
+    log_router_analytics, create_uploaded_document, get_uploaded_documents,
+    documents_not_owned_by, delete_message
 )
 from app.services.converter import fetch_and_convert_url
 import re
@@ -95,11 +96,158 @@ def _get_rejection_hint(mime: str) -> str:
     return f"File type '{mime}' is not supported. Accepted types: PDF, DOCX, DOC, TXT, MD, CSV, RTF, HTML, and images (PNG, JPEG, WebP, GIF)."
 
 
+_EXTENSION_MIMES = {
+    ".pdf": "application/pdf",
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".csv": "text/csv",
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".rtf": "application/rtf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
+
+def _resolve_mime(content_type: str, filename: str) -> str:
+    """Falls back to the file extension when the browser reports nothing useful.
+
+    Browsers frequently send an empty type or application/octet-stream for .docx on
+    Linux and Android. The client accepts those on extension, so the server rejecting
+    them on content_type alone produced a 415 whose message listed DOCX as supported.
+    """
+    base = (content_type or "").split(";")[0].strip().lower()
+    if base and base != "application/octet-stream" and base in SUPPORTED_MIME_TYPES:
+        return base
+    ext = os.path.splitext(filename or "")[1].lower()
+    return _EXTENSION_MIMES.get(ext, base)
+
+
+async def _rollback_user_message(message_id: Optional[str]) -> None:
+    """Removes a pre-saved user turn after the request failed.
+
+    The turn is written before generation so a mid-flight reload still shows it, but
+    leaving it behind on failure meant every retry appended another copy of the same
+    question to the transcript.
+    """
+    if not message_id:
+        return
+    try:
+        await delete_message(message_id)
+    except Exception:
+        logger.warning(f"Could not roll back pre-saved user message {message_id}")
+
+
+def safe_citations_for_storage(rag_result: dict, is_conversational: bool) -> list:
+    """Citation metadata for the `sources` column.
+
+    Deliberately omits `text`: a parent document is 20k+ chars and there can be five
+    of them per answer, so persisting the bodies would bloat every row. Titles and
+    links are enough to re-render the citation chips after a reload.
+    """
+    if is_conversational:
+        return []
+    seen, out = set(), []
+    for doc in rag_result.get("parent_documents", []):
+        doc_id = doc.get("source_doc_id")
+        if doc_id in seen:
+            continue
+        seen.add(doc_id)
+        out.append({
+            "id": doc_id,
+            "title": doc.get("root_title", "Untitled Document"),
+            "source_url": doc.get("source_url", "#"),
+        })
+    return out
+
+
+def _read_text_file(path: str) -> str:
+    """Reads an already-textual upload off disk, tolerating imperfect encodings."""
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+
+def _gemini_expiry(uploaded_file: Any):
+    """Real expiry from the Files API response, falling back to the documented 48h."""
+    from datetime import datetime, timedelta, timezone
+    raw = getattr(uploaded_file, "expiration_time", None)
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) + timedelta(hours=48)
+
+
+def _file_state_name(file: Any) -> str:
+    """Normalises a Gemini FileState to its bare name, e.g. 'ACTIVE'.
+
+    google-genai returns an enum whose str() is 'FileState.ACTIVE', so the old
+    `str(state).upper() in ("ACTIVE", ...)` check was ALWAYS false — every upload
+    burned the full 30s timeout and then proceeded with an unverified file.
+    """
+    state = getattr(file, "state", None)
+    if state is None:
+        return "ACTIVE"  # older responses omit state entirely; treat as ready
+    return str(getattr(state, "name", state)).upper()
+
+
+async def _await_file_active(client: Any, file: Any, max_wait_seconds: int = 30) -> Any:
+    """Polls a freshly uploaded Gemini file until it leaves PROCESSING.
+
+    Raises HTTPException if the file fails to process — previously the loop just
+    logged a warning and handed a non-ACTIVE file to generate_content.
+    """
+    waited = 0
+    while _file_state_name(file) == "PROCESSING":
+        if waited >= max_wait_seconds:
+            raise HTTPException(
+                status_code=504,
+                detail="The file is taking too long to process. Please try again, "
+                       "or upload a smaller file.",
+            )
+        await asyncio.sleep(1)
+        waited += 1
+        file = await client.client.aio.files.get(name=file.name)
+        logger.debug(f"File state: {file.state} (waited {waited}s)")
+
+    state = _file_state_name(file)
+    if state == "FAILED":
+        raise HTTPException(
+            status_code=422,
+            detail="The AI service could not process this file. It may be corrupted "
+                   "or in an unsupported sub-format.",
+        )
+
+    logger.info(f"File ready in {waited}s: {file.name} | state={state}")
+    return file
+
+
+# How many recent messages are replayed to the LLM each turn. Deliberately smaller than
+# the DB retention window (MAX_WINDOW_MESSAGES) — retention protects history from being
+# deleted, this bounds per-turn token cost.
+LLM_HISTORY_MESSAGES = 12
+
+
 class FileAttachment(BaseModel):
-    uri: str = Field(..., description="Google GenAI File URI")
-    mime_type: str = Field(..., description="MIME type of the file")
-    name: str = Field(..., description="Internal Google name for the file")
-    display_name: str = Field(..., description="Original filename")
+    """An attachment on the current turn.
+
+    `document_id` is the modern form and the only one that survives across turns.
+
+    The Gemini-handle fields are legacy. They are still ACCEPTED, but note the limit
+    of that compatibility: text documents (docx/doc/rtf/csv/html) now return
+    `uri: null`, and an old client bundle filters attachments on `f.uri`, so such a
+    client will silently drop a .docx it just uploaded. Images and PDFs still carry a
+    uri and keep working. This self-heals on refresh; it is a rollout window, not a
+    supported mode.
+    """
+    document_id: Optional[str] = Field(default=None, description="uploaded_documents.id")
+    uri: Optional[str] = Field(default=None, description="Legacy Google GenAI File URI")
+    mime_type: Optional[str] = Field(default=None, description="MIME type of the file")
+    name: Optional[str] = Field(default=None, description="Legacy internal Google file name")
+    display_name: Optional[str] = Field(default=None, description="Original filename")
     s3_key: Optional[str] = Field(default=None, description="S3/R2 storage key for persistent access")
 
 class ChatRequest(BaseModel):
@@ -120,8 +268,11 @@ async def _background_history_maintenance(
     preventing long blocking API responses.
     """
     try:
-        # Check sliding window size
-        MAX_WINDOW_MESSAGES = 10
+        # Retention: how many messages stay in the DB before being folded into the
+        # archive summary. Commit 97db6a3 raised this to 40 to stop premature deletion;
+        # 7093947 silently regressed it to 10. Note this is NOT the same knob as how
+        # many messages get fed to the LLM (see LLM_HISTORY_MESSAGES).
+        MAX_WINDOW_MESSAGES = 40
         current_messages = await get_session_messages(session_id, limit=100)
         
         if len(current_messages) > MAX_WINDOW_MESSAGES:
@@ -133,10 +284,17 @@ async def _background_history_maintenance(
                     current_messages.pop(0)
             
             if dropped_messages:
-                dropped_text = "\n\n".join(
-                    f"{msg['role'].capitalize()}: {msg['content']}" 
-                    for msg in dropped_messages
-                )
+                def _render(msg):
+                    line = f"{msg['role'].capitalize()}: {msg['content']}"
+                    # Record that a document was involved, otherwise folding a message
+                    # into the summary erases every trace that it ever existed.
+                    names = [a.get("display_name") for a in (msg.get("attachments") or [])
+                             if isinstance(a, dict) and a.get("display_name")]
+                    if names:
+                        line += f"\n[attached: {', '.join(names)}]"
+                    return line
+
+                dropped_text = "\n\n".join(_render(msg) for msg in dropped_messages)
                 new_summary = await client.summarize_archive(
                     old_messages=dropped_text,
                     previous_summary=session_summary
@@ -181,10 +339,13 @@ async def upload_file(
         client = await get_llm_client()
 
         # ── 1. Validate MIME type ────────────────────────────
-        content_type = file.content_type or ""
-        base_mime = content_type.split(";")[0].strip().lower()
+        base_mime = _resolve_mime(file.content_type or "", file.filename or "")
 
         if base_mime not in SUPPORTED_MIME_TYPES:
+            logger.info(
+                f"Rejected upload '{file.filename}': browser sent "
+                f"content_type={file.content_type!r}, resolved to {base_mime!r}"
+            )
             raise HTTPException(
                 status_code=415,
                 detail=_get_rejection_hint(base_mime)
@@ -224,9 +385,13 @@ async def upload_file(
         logger.info(f"Processing upload: '{display_name}' ({base_mime}, {total:,} bytes)")
 
         # ── 4. Convert if needed (MarkItDown) ───────────────
+        # Text-ish documents become Markdown and are stored as TEXT. They are never sent
+        # to the Gemini Files API, which is what used to make them expire after 48h or
+        # become unreadable (403) once ApiKeyManager rotated to a different key.
         upload_path = original_tmp_path
         upload_mime = base_mime
         upload_display_name = display_name
+        markdown_text: Optional[str] = None
 
         if base_mime in CONVERTIBLE_MIME_TYPES:
             markdown_text = await convert_to_markdown(original_tmp_path, base_mime, display_name)
@@ -235,41 +400,64 @@ async def upload_file(
                 upload_path = converted_tmp_path
                 upload_mime = "text/markdown"
                 upload_display_name = os.path.splitext(display_name)[0] + ".md"
-                logger.info(f"Using converted Markdown file for upload: '{upload_display_name}'")
+                logger.info(f"Converted '{display_name}' to Markdown ({len(markdown_text):,} chars)")
+        elif base_mime in ("text/plain", "text/markdown"):
+            # Already text — read it straight off disk, no conversion needed.
+            markdown_text = await asyncio.to_thread(_read_text_file, original_tmp_path)
 
-        # ── 5. Upload to Gemini Files API ────────────────────
-        uploaded_file = await client.client.aio.files.upload(
-            file=upload_path,
-            config={
-                "display_name": upload_display_name,
-                "mime_type": upload_mime,
-            }
+        is_text_doc = markdown_text is not None and markdown_text.strip() != ""
+        kind = "text" if is_text_doc else "media"
+
+        # ── 5. Persist to S3/R2 (used for previews and for media re-minting) ──
+        s3_key = await upload_file_to_s3(upload_path, upload_display_name, upload_mime)
+        if not s3_key and not is_text_doc:
+            logger.warning(
+                f"S3/R2 is not configured — media file '{display_name}' has no durable copy "
+                f"and will become unreadable once its Gemini handle expires."
+            )
+
+        # ── 6. Media only: upload to Gemini Files API ────────
+        gemini_uri = gemini_name = gemini_mime = None
+        gemini_expires_at = None
+        if not is_text_doc:
+            uploaded_file = await client.client.aio.files.upload(
+                file=upload_path,
+                config={
+                    "display_name": upload_display_name,
+                    "mime_type": upload_mime,
+                }
+            )
+            uploaded_file = await _await_file_active(client, uploaded_file)
+            gemini_uri = uploaded_file.uri
+            gemini_name = uploaded_file.name
+            gemini_mime = uploaded_file.mime_type or upload_mime
+            gemini_expires_at = _gemini_expiry(uploaded_file)
+
+        # ── 7. Record in the durable document store ──────────
+        document_id = await create_uploaded_document(
+            user_id=user["id"] if user else None,
+            display_name=display_name,   # always the ORIGINAL filename
+            original_mime=upload_mime,
+            kind=kind,
+            extracted_text=markdown_text if is_text_doc else None,
+            s3_key=s3_key,
+            gemini_uri=gemini_uri,
+            gemini_name=gemini_name,
+            gemini_mime=gemini_mime,
+            gemini_expires_at=gemini_expires_at,
         )
 
-        # ── 6. Wait for ACTIVE state ─────────────────────────
-        max_wait_seconds = 30
-        waited = 0
-        while getattr(uploaded_file, "state", None) and \
-              str(uploaded_file.state).upper() not in ("ACTIVE", "FILE_STATE_ACTIVE", "2"):
-            if waited >= max_wait_seconds:
-                logger.warning(f"File {uploaded_file.name} not ACTIVE after {max_wait_seconds}s, proceeding.")
-                break
-            await asyncio.sleep(2)
-            waited += 2
-            uploaded_file = await client.client.aio.files.get(name=uploaded_file.name)
-            logger.debug(f"File state: {uploaded_file.state} (waited {waited}s)")
-
-        logger.info(f"File ready: {uploaded_file.name} | state={getattr(uploaded_file, 'state', 'unknown')}")
-
-        # ── 7. Upload to S3/R2 (Parallel or Sequential) ───────
-        s3_key = await upload_file_to_s3(upload_path, upload_display_name, upload_mime)
-
         return {
-            "uri": uploaded_file.uri,
-            "mime_type": uploaded_file.mime_type or upload_mime,
-            "name": uploaded_file.name,
+            "document_id": document_id,
+            "kind": kind,
             "display_name": display_name,  # Always show the original filename to the user
+            "mime_type": base_mime,        # the ORIGINAL type, so the UI shows "DOCX"
             "s3_key": s3_key,
+            # Legacy fields. Populated only for media — text documents no longer touch
+            # the Files API, so a stale client that filters on `uri` will drop them.
+            # See FileAttachment for the rollout caveat.
+            "uri": gemini_uri,
+            "name": gemini_name,
         }
 
     except HTTPException:
@@ -321,7 +509,7 @@ async def ask_advoai(
 
         if session_id:
             session_summary = session.get("session_summary", "")
-            recent_messages = await get_session_messages(session_id, limit=5)
+            recent_messages = await get_session_messages(session_id, limit=LLM_HISTORY_MESSAGES)
 
         # ── 2. Intent Routing ───────────────────────────────
         # If user attached files, let the router know in the question text
@@ -420,68 +608,64 @@ async def ask_advoai(
             parents.extend(url_parents)
             rag_result["parent_documents"] = parents
 
-        # ── 4. Verify & Re-upload Expired Attachments ───────
-        if request.attachments:
-            for att in request.attachments:
-                try:
-                    await client.client.aio.files.get(name=att.name)
-                except Exception as e:
-                    logger.warning(f"Gemini file {att.name} expired or not found. Attempting S3 re-upload. Error: {e}")
-                    if att.s3_key:
-                        tmp_path = await download_file_from_s3(att.s3_key)
-                        if tmp_path:
-                            # Re-upload to Gemini
-                            try:
-                                uploaded_file = await client.client.aio.files.upload(
-                                    file=tmp_path,
-                                    config={
-                                        "display_name": att.display_name,
-                                        "mime_type": att.mime_type,
-                                    }
-                                )
-                                # Wait for ACTIVE state
-                                max_wait_seconds = 30
-                                waited = 0
-                                while getattr(uploaded_file, "state", None) and \
-                                      str(uploaded_file.state).upper() not in ("ACTIVE", "FILE_STATE_ACTIVE", "2"):
-                                    if waited >= max_wait_seconds:
-                                        break
-                                    await asyncio.sleep(2)
-                                    waited += 2
-                                    uploaded_file = await client.client.aio.files.get(name=uploaded_file.name)
-                                
-                                # Update attachment references
-                                att.uri = uploaded_file.uri
-                                att.name = uploaded_file.name
-                                logger.info(f"Successfully re-uploaded {att.s3_key} to Gemini: {att.name}")
-                            except Exception as up_err:
-                                logger.error(f"Failed to re-upload to Gemini: {up_err}")
-                            finally:
-                                import os
-                                try:
-                                    os.remove(tmp_path)
-                                except Exception:
-                                    pass
+        # ── 4. Resolve attachments ──────────────────────────
+        # Documents from the durable store need no verification: text documents are read
+        # straight from Postgres, and media handles are re-minted on demand inside
+        # build_parts(). Only legacy inline Gemini URIs still need a liveness check.
+        document_ids = [att.document_id for att in (request.attachments or []) if att.document_id]
+        legacy_attachments = [att for att in (request.attachments or [])
+                              if not att.document_id and att.uri]
+
+        # document_ids arrive straight from the client, so ownership must be checked
+        # here. (History rehydration needs no check — session ownership already gates it.)
+        if document_ids:
+            forbidden = await documents_not_owned_by(document_ids, user["id"] if user else None)
+            if forbidden:
+                raise HTTPException(
+                    status_code=403,
+                    detail="One or more attached files are not available to you.",
+                )
+
+        for att in legacy_attachments:
+            if not att.name:
+                continue
+            try:
+                await client.client.aio.files.get(name=att.name)
+            except Exception as e:
+                logger.warning(f"Legacy Gemini file {att.name} is not accessible: {e}")
+                raise HTTPException(
+                    status_code=410,
+                    detail=f"'{att.display_name or 'The attached file'}' is no longer available. "
+                           f"Please attach it again.",
+                )
 
         # ── 5a. Pre-save user message so reloads show it mid-processing ──
+        # Persist EVERY attachment, keyed by document_id. The old code filtered on
+        # `if att.s3_key`, so when R2 was unconfigured the attachment vanished from
+        # history entirely — the chat showed a file the model could never see again.
         attachment_meta = None
+        user_message_id: Optional[str] = None
         if session_id:
             try:
                 if request.attachments:
                     attachment_meta = [
                         {
-                            "s3_key": att.s3_key,
+                            "document_id": att.document_id,
+                            "s3_key": att.s3_key or None,
                             "display_name": att.display_name,
                             "mime_type": att.mime_type,
                         }
                         for att in request.attachments
-                        if att.s3_key
                     ] or None
-                await insert_message(session_id, "user", request.question, attachments=attachment_meta)
+                user_message_id = await insert_message(
+                    session_id, "user", request.question, attachments=attachment_meta)
             except Exception as se:
                 logger.warning(f"Pre-save user message failed (non-fatal): {se}")
 
         # ── 5b. Generate answer with Main LLM ───────────────
+        # The user turn was pre-saved above so a mid-flight reload still shows it.
+        # If generation fails we must remove it again, or each retry appends another
+        # copy of the same question to the transcript.
         llm_time_ms = None
         try:
             start_llm = time.monotonic()
@@ -491,7 +675,8 @@ async def ask_advoai(
                 context_markdown=rag_result.get("context_markdown", ""),
                 session_summary=session_summary,
                 is_conversational=is_conversational,
-                attachments=request.attachments
+                attachments=legacy_attachments,
+                document_ids=document_ids,
             )
             llm_time_ms = int((time.monotonic() - start_llm) * 1000)
             logger.info(f"✅ Main LLM ({client.main_model}) generation completed in {llm_time_ms}ms")
@@ -501,19 +686,47 @@ async def ask_advoai(
                 status_code=503,
                 detail="Unable to reach the AI service. Please check your internet connection and try again."
             )
+        except EmptyLLMResponse as empty_err:
+            logger.error(f"LLM returned no text (finish_reason={empty_err.finish_reason})")
+            if empty_err.finish_reason == "MAX_TOKENS":
+                detail = ("The response was too long to complete. Please ask about a "
+                          "narrower part of the document.")
+            elif empty_err.finish_reason in ("SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST"):
+                detail = ("The AI declined to answer this request. Please rephrase your "
+                          "question.")
+            else:
+                detail = ("The AI returned an empty response. Please try again or "
+                          "rephrase your question.")
+            raise HTTPException(status_code=502, detail=detail)
         except Exception as llm_err:
             err_str = str(llm_err)
-            if "token count exceeds" in err_str or "INVALID_ARGUMENT" in err_str:
+            # Only a genuine context-window overflow is a "file too large" problem.
+            # The old check also swallowed every INVALID_ARGUMENT — and, by falling
+            # through, every 403 PERMISSION_DENIED from a stale file URI became an
+            # opaque 500. Log the real error and report something actionable.
+            logger.exception("Main LLM generation failed")
+            if "token count exceeds" in err_str or "exceeds the maximum number of tokens" in err_str:
                 raise HTTPException(
                     status_code=413,
                     detail="The attached file is too large for the AI to process in a single request. Please try a smaller file or ask about a specific section of the document."
+                )
+            if "PERMISSION_DENIED" in err_str or "NOT_FOUND" in err_str:
+                raise HTTPException(
+                    status_code=410,
+                    detail="One of the attached files is no longer available to the AI. "
+                           "Please attach it again."
                 )
             raise
 
         # ── 5c. Save assistant reply & run history maintenance ─
         if session_id:
             try:
-                await insert_message(session_id, "assistant", llm_result["answer"])
+                # Persist citations too — the `sources` column existed but was never
+                # written, so a cross-device reload silently lost every citation.
+                await insert_message(
+                    session_id, "assistant", llm_result["answer"],
+                    sources=safe_citations_for_storage(rag_result, is_conversational),
+                )
 
                 # Check sliding window size and summarize in background
                 background_tasks.add_task(
@@ -572,12 +785,15 @@ async def ask_advoai(
         }
 
     except HTTPException:
+        await _rollback_user_message(locals().get("user_message_id"))
         raise
     except ValueError as ve:
-        logger.error(f"Configuration error: {ve}")
+        await _rollback_user_message(locals().get("user_message_id"))
+        logger.exception("Configuration error")
         raise HTTPException(status_code=500, detail="Server configuration error. Ensure API keys are set.")
-    except Exception as e:
-        logger.error(f"Chat API error: {e}")
+    except Exception:
+        await _rollback_user_message(locals().get("user_message_id"))
+        logger.exception("Chat API error")
         raise HTTPException(status_code=500, detail="An error occurred while processing your request.")
 
 

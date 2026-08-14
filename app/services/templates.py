@@ -51,6 +51,30 @@ CONTRACT_TEMPLATES = {
 
 **4. МУДДАТ (TERM)**
 Шартнома [Start Date] дан [End Date] гача тузилади.
+""",
+    # The wizard has always offered a "Service Agreement" card, but there was no
+    # template behind it, so it silently fell through to the not-found message.
+    "Service": """
+### ХИЗМАТ КЎРСАТИШ ШАРТНОМАСИ (Service Agreement Template)
+
+**1. ТАРАФЛАР (PARTIES)**
+Буюртмачи (Client): [Name, Requisites]
+Ижрочи (Contractor): [Name, Requisites]
+
+**2. ШАРТНОМА ПРЕДМЕТИ (SUBJECT OF THE CONTRACT)**
+Ижрочи Буюртмачига [Service Description] хизматларини кўрсатиш мажбуриятини олади.
+
+**3. ХИЗМАТ НАРХИ ВА ТЎЛОВ ТАРТИБИ (PRICE AND PAYMENT)**
+Хизматлар қиймати [Amount] сўмни ташкил этади. Тўлов [Payment Terms] тартибида амалга оширилади.
+
+**4. БАЖАРИШ МУДДАТЛАРИ (DEADLINES)**
+Хизматлар [Start Date] дан [End Date] гача кўрсатилади.
+
+**5. ТОМОНЛАРНИНГ ЖАВОБГАРЛИГИ (LIABILITY)**
+Мажбуриятлар бузилган тақдирда, айбдор тараф Фуқаролик кодексига мувофиқ жавобгар бўлади.
+
+**6. НИЗОЛАРНИ ҲАЛ ҚИЛИШ (DISPUTE RESOLUTION)**
+Низолар музокаралар йўли билан, келишувга эришилмаса судда ҳал этилади.
 """
 }
 

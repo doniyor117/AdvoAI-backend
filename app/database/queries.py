@@ -463,27 +463,46 @@ async def delete_session(session_id: str) -> None:
         await cur.execute("DELETE FROM chat_sessions WHERE id = %s::uuid;", (session_id,))
 
 
-async def insert_message(session_id: str, role: str, content: str, attachments: list = None) -> None:
+async def insert_message(
+    session_id: str, role: str, content: str,
+    attachments: list = None, sources: Any = None,
+) -> str:
     """
-    Saves a chat message. Attachments are stored as JSONB (list of dicts with
-    s3_key, display_name, mime_type) — no Gemini URIs which expire.
+    Saves a chat message and returns its id.
+
+    Attachments are stored as JSONB (document_id, display_name, mime_type, s3_key).
+    `sources` holds citations, or a structured payload such as a comparison result.
     """
     import json
     attachments_json = json.dumps(attachments) if attachments else None
+    sources_json = json.dumps(sources) if sources else None
     sql = """
-        INSERT INTO chat_messages (session_id, role, content, attachments)
-        VALUES (%s::uuid, %s, %s, %s::jsonb);
+        INSERT INTO chat_messages (session_id, role, content, attachments, sources)
+        VALUES (%s::uuid, %s, %s, %s::jsonb, %s::jsonb)
+        RETURNING id;
     """
     async with get_connection() as cur:
-        await cur.execute(sql, (session_id, role, content, attachments_json))
+        await cur.execute(sql, (session_id, role, content, attachments_json, sources_json))
+        row = cur.fetchone()
         # Also touch the session
         await cur.execute("UPDATE chat_sessions SET updated_at = NOW() WHERE id = %s::uuid;", (session_id,))
+    return str(row["id"])
+
+
+def _maybe_json(value: Any) -> Any:
+    """asyncpg hands back jsonb as a string in some configurations."""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return None
+    return value
 
 
 async def get_session_messages(session_id: str, limit: int = 10) -> List[Dict[str, Any]]:
     """Fetches the last N messages for a session, ordered chronologically."""
     sql = """
-        SELECT id, role, content, attachments, created_at
+        SELECT id, role, content, attachments, sources, created_at
         FROM chat_messages
         WHERE session_id = %s::uuid
         ORDER BY created_at DESC
@@ -492,26 +511,28 @@ async def get_session_messages(session_id: str, limit: int = 10) -> List[Dict[st
     async with get_connection() as cur:
         await cur.execute(sql, (session_id, limit))
         rows = cur.fetchall()
-    
+
     # Reverse to return in chronological order
-    import json
     result = []
     for row in reversed(rows):
-        att_data = row.get("attachments")
-        if isinstance(att_data, str):
-            try:
-                att_data = json.loads(att_data)
-            except Exception:
-                pass
-
         result.append({
             "id": str(row["id"]),
             "role": row["role"],
             "content": row["content"],
-            "attachments": att_data or None,
+            "attachments": _maybe_json(row.get("attachments")) or None,
+            # Returned so citations and comparison payloads survive a reload; the
+            # column existed but was never selected, so they were lost cross-device.
+            "sources": _maybe_json(row.get("sources")) or None,
             "created_at": row["created_at"].isoformat()
         })
     return result
+
+
+async def delete_message(message_id: str) -> None:
+    """Removes a single message. Used to roll back a pre-saved user turn when
+    generation fails, so retrying does not leave a duplicate orphan in the chat."""
+    async with get_connection() as cur:
+        await cur.execute("DELETE FROM chat_messages WHERE id = %s::uuid;", (message_id,))
 
 
 async def delete_oldest_message(session_id: str) -> Optional[Dict[str, Any]]:
@@ -524,19 +545,123 @@ async def delete_oldest_message(session_id: str) -> Optional[Dict[str, Any]]:
             ORDER BY created_at ASC 
             LIMIT 1
         )
-        RETURNING id, role, content, created_at;
+        RETURNING id, role, content, attachments, created_at;
     """
     async with get_connection() as cur:
         await cur.execute(sql, (session_id,))
         row = cur.fetchone()
-    
+
     if row:
+        import json
+        att = row.get("attachments")
+        if isinstance(att, str):
+            try:
+                att = json.loads(att)
+            except Exception:
+                att = None
         return {
             "id": str(row["id"]),
             "role": row["role"],
             "content": row["content"],
+            # Returned so the archive summariser can record that a document existed.
+            # Without this, folding a message into the summary erased every trace of it.
+            "attachments": att or None,
         }
     return None
+
+
+# ── Uploaded Document Store ───────────────────────────────────
+# Backs the attachment pipeline. See schema_unified.sql V6 for why this exists.
+
+async def create_uploaded_document(
+    *,
+    user_id: Optional[str],
+    display_name: str,
+    original_mime: str,
+    kind: str,
+    extracted_text: Optional[str] = None,
+    s3_key: Optional[str] = None,
+    gemini_uri: Optional[str] = None,
+    gemini_name: Optional[str] = None,
+    gemini_mime: Optional[str] = None,
+    gemini_expires_at: Optional[Any] = None,
+) -> str:
+    """Persists an uploaded document and returns its id."""
+    sql = """
+        INSERT INTO uploaded_documents
+            (user_id, display_name, original_mime, kind, extracted_text, s3_key,
+             gemini_uri, gemini_name, gemini_mime, gemini_expires_at)
+        VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id;
+    """
+    async with get_connection() as cur:
+        await cur.execute(sql, (
+            user_id, display_name, original_mime, kind, extracted_text, s3_key,
+            gemini_uri, gemini_name, gemini_mime, gemini_expires_at,
+        ))
+        row = cur.fetchone()
+    return str(row["id"])
+
+
+async def get_uploaded_documents(doc_ids: List[str]) -> List[Dict[str, Any]]:
+    """Fetches documents by id. Order of the input list is preserved.
+
+    Note: this performs NO ownership check — callers that accept ids straight from a
+    client must use `assert_documents_owned` first. History rehydration is already
+    gated by session ownership and can call this directly.
+    """
+    if not doc_ids:
+        return []
+
+    sql = """
+        SELECT id, user_id, display_name, original_mime, kind, extracted_text,
+               s3_key, gemini_uri, gemini_name, gemini_mime, gemini_expires_at
+        FROM uploaded_documents
+        WHERE id = ANY(%s::uuid[]);
+    """
+    async with get_connection() as cur:
+        await cur.execute(sql, (list(doc_ids),))
+        rows = cur.fetchall()
+
+    by_id = {str(r["id"]): {**dict(r), "id": str(r["id"])} for r in rows}
+    return [by_id[d] for d in doc_ids if d in by_id]
+
+
+async def documents_not_owned_by(doc_ids: List[str], user_id: Optional[str]) -> List[str]:
+    """Returns the subset of `doc_ids` this user may NOT read.
+
+    Documents uploaded by guests have user_id NULL and are readable by anyone who
+    holds the id (an unguessable UUID); documents owned by a *different* user are not.
+    """
+    if not doc_ids:
+        return []
+
+    sql = """
+        SELECT id, user_id FROM uploaded_documents WHERE id = ANY(%s::uuid[]);
+    """
+    async with get_connection() as cur:
+        await cur.execute(sql, (list(doc_ids),))
+        rows = cur.fetchall()
+
+    found = {str(r["id"]): (str(r["user_id"]) if r["user_id"] else None) for r in rows}
+    bad = [d for d in doc_ids if d not in found]                      # missing entirely
+    bad += [d for d, owner in found.items()
+            if owner is not None and owner != (user_id or "")]        # someone else's
+    return bad
+
+
+async def update_document_gemini_handle(
+    doc_id: str, gemini_uri: str, gemini_name: str,
+    gemini_mime: str, gemini_expires_at: Any,
+) -> None:
+    """Caches a freshly minted Gemini Files handle for a media document."""
+    sql = """
+        UPDATE uploaded_documents
+        SET gemini_uri = %s, gemini_name = %s, gemini_mime = %s, gemini_expires_at = %s
+        WHERE id = %s::uuid;
+    """
+    async with get_connection() as cur:
+        await cur.execute(sql, (gemini_uri, gemini_name, gemini_mime, gemini_expires_at, doc_id))
 
 
 # ── Usage Tracking Queries ────────────────────────────────────

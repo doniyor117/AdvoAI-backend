@@ -4,9 +4,10 @@ from app.services.llm_client import GeminiClient
 from google.genai import types
 
 @pytest.mark.asyncio
-@patch('app.services.llm_client.genai.Client')
-async def test_route_query_conversational(mock_genai_client):
-    mock_instance = mock_genai_client.return_value
+@patch('app.services.llm_client.api_key_manager')
+async def test_route_query_conversational(mock_key_manager):
+    mock_instance = mock_key_manager.get_current_client.return_value
+    mock_key_manager.keys = ['k1']
     mock_response = MagicMock()
     mock_response.candidates = None
     mock_response.text = '{"intent": "conversational"}'
@@ -22,9 +23,10 @@ async def test_route_query_conversational(mock_genai_client):
     assert kwargs["model"] == "gemma-4"
 
 @pytest.mark.asyncio
-@patch('app.services.llm_client.genai.Client')
-async def test_route_query_legal_rag(mock_genai_client):
-    mock_instance = mock_genai_client.return_value
+@patch('app.services.llm_client.api_key_manager')
+async def test_route_query_legal_rag(mock_key_manager):
+    mock_instance = mock_key_manager.get_current_client.return_value
+    mock_key_manager.keys = ['k1']
     mock_response = MagicMock()
     mock_response.candidates = None
     mock_response.text = '{"intent": "legal_rag", "search_query": "contract penalty"}'
@@ -37,9 +39,10 @@ async def test_route_query_legal_rag(mock_genai_client):
     assert routing_data["search_query"] == "contract penalty"
 
 @pytest.mark.asyncio
-@patch('app.services.llm_client.genai.Client')
-async def test_route_query_with_history(mock_genai_client):
-    mock_instance = mock_genai_client.return_value
+@patch('app.services.llm_client.api_key_manager')
+async def test_route_query_with_history(mock_key_manager):
+    mock_instance = mock_key_manager.get_current_client.return_value
+    mock_key_manager.keys = ['k1']
     mock_response = MagicMock()
     mock_response.candidates = None
     mock_response.text = '{"intent": "legal_rag", "search_query": "civil code details"}'
@@ -57,9 +60,10 @@ async def test_route_query_with_history(mock_genai_client):
     assert "Current Query: Do you know anything else about it?" in kwargs["contents"]
 
 @pytest.mark.asyncio
-@patch('app.services.llm_client.genai.Client')
-async def test_ask_method(mock_genai_client):
-    mock_instance = mock_genai_client.return_value
+@patch('app.services.llm_client.api_key_manager')
+async def test_ask_method(mock_key_manager):
+    mock_instance = mock_key_manager.get_current_client.return_value
+    mock_key_manager.keys = ['k1']
     mock_response = MagicMock()
     mock_response.text = "This is the answer"
     mock_response.usage_metadata.candidates_token_count = 10
@@ -108,9 +112,10 @@ async def test_ask_method(mock_genai_client):
     assert "Context" in third_text
 
 @pytest.mark.asyncio
-@patch('app.services.llm_client.genai.Client')
-async def test_ask_conversational(mock_genai_client):
-    mock_instance = mock_genai_client.return_value
+@patch('app.services.llm_client.api_key_manager')
+async def test_ask_conversational(mock_key_manager):
+    mock_instance = mock_key_manager.get_current_client.return_value
+    mock_key_manager.keys = ['k1']
     mock_response = MagicMock()
     mock_response.text = "Hello!"
     mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_response)

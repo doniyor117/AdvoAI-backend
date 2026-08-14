@@ -27,9 +27,34 @@ from app.services.prompts import (
     TITLE_SYSTEM_PROMPT,
     ROUTER_SYSTEM_PROMPT,
     METADATA_EXTRACTION_SYSTEM_PROMPT,
+    COMPARE_SYSTEM_PROMPT,
+    DRAFT_SYSTEM_PROMPT,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class EmptyLLMResponse(RuntimeError):
+    """The model returned no usable text (blocked, truncated, or no candidate at all).
+
+    Carries the finish_reason so the route layer can tell the user something specific
+    instead of a generic 500.
+    """
+
+    def __init__(self, finish_reason: str = "UNKNOWN"):
+        self.finish_reason = finish_reason
+        super().__init__(f"Model returned no text (finish_reason={finish_reason})")
+
+
+def _finish_reason(response: Any) -> str:
+    """Best-effort extraction of the finish reason from a GenerateContentResponse."""
+    try:
+        candidate = response.candidates[0]
+        reason = candidate.finish_reason
+        return str(getattr(reason, "name", reason) or "UNKNOWN")
+    except Exception:
+        return "UNKNOWN"
+
 
 class GeminiClient:
     """
@@ -57,6 +82,19 @@ class GeminiClient:
         """Returns the dynamically active genai.Client from the ApiKeyManager."""
         return api_key_manager.get_current_client()
 
+    # 4xx statuses that will never succeed on retry. Burning the full backoff ladder on
+    # these costs ~15s and 5 API calls for an outcome that is already decided — and it
+    # was the reason a stale-file 403 looked like a slow generic server error.
+    _NON_RETRYABLE = ("400", "401", "403", "404", "PERMISSION_DENIED",
+                      "NOT_FOUND", "UNAUTHENTICATED", "INVALID_ARGUMENT")
+
+    @staticmethod
+    def _is_retryable(err_str: str) -> bool:
+        """429/RESOURCE_EXHAUSTED are always worth retrying; other 4xx never are."""
+        if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+            return True
+        return not any(marker in err_str for marker in GeminiClient._NON_RETRYABLE)
+
     async def _generate_with_retry(self, model: str, contents: Any, config: Any, max_retries: int = 5):
         """Helper to execute generate_content with exponential backoff retries and key rotation."""
         keys_tried = 1
@@ -73,14 +111,18 @@ class GeminiClient:
                 if attempt == max_retries - 1:
                     logger.error(f"❌ LLM API failed after {max_retries} attempts: {e}")
                     raise
-                    
+
+                if not self._is_retryable(err_str):
+                    logger.error(f"❌ LLM API returned a non-retryable error, failing fast: {e}")
+                    raise
+
                 if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
                     if len(api_key_manager.keys) > 1 and keys_tried < len(api_key_manager.keys):
                         api_key_manager.rotate_key()
                         keys_tried += 1
                         logger.info(f"Retrying generation immediately with new API key...")
                         continue # retry immediately without sleeping
-                
+
                 wait_time = 2 ** attempt
                 logger.warning(f"⚠️ LLM API error: {e}. Retrying in {wait_time}s... (Attempt {attempt+1}/{max_retries})")
                 await asyncio.sleep(wait_time)
@@ -134,10 +176,23 @@ class GeminiClient:
                 data = json.loads(match.group(0))
                 intent = data.get("intent", "legal_rag")
                 search_query = data.get("search_query", "") if intent == "conversational" else data.get("search_query", question)
-                return {"intent": intent, "search_query": search_query}
+
+                # ROUTER_SYSTEM_PROMPT explicitly asks for these two. Dropping them meant
+                # CONTRACT_TEMPLATES was unreachable and adaptive top-k never took effect.
+                routed = {"intent": intent, "search_query": search_query}
+
+                ideal_top_k = data.get("ideal_top_k")
+                if isinstance(ideal_top_k, (int, float)) or (isinstance(ideal_top_k, str) and ideal_top_k.isdigit()):
+                    routed["ideal_top_k"] = max(3, min(10, int(ideal_top_k)))
+
+                contract_type = data.get("contract_type")
+                if isinstance(contract_type, str) and contract_type.strip():
+                    routed["contract_type"] = contract_type.strip()
+
+                return routed
             except json.JSONDecodeError:
                 pass
-                
+
         # Fallback
         if "conversational" in final_text.lower():
             return {"intent": "conversational", "search_query": ""}
@@ -150,21 +205,42 @@ class GeminiClient:
         context_markdown: str = "",
         session_summary: str = "",
         is_conversational: bool = False,
-        attachments: list = None
+        attachments: list = None,
+        document_ids: list = None,
     ) -> Dict[str, Any]:
         """
         Answers the user's question. If is_conversational=True, ignores context_markdown.
         Uses structured_history for multi-turn conversational awareness natively.
-        Supports multimodal attachments via Google GenAI File URIs.
+
+        Attachments come in two forms:
+          - `document_ids`: ids into `uploaded_documents` for the CURRENT turn.
+          - `attachments`:  legacy inline {uri, mime_type} objects, kept so older
+                            clients keep working during rollout.
+
+        History attachments are rehydrated from each message's own `attachments`
+        metadata. Replaying them is what stops the model from asking the user to
+        re-upload a document that is sitting right there in the chat.
         """
+        from app.services.attachments import build_parts, doc_ids_from_message
+
         payload = []
 
-        # 1. Map prior history turns to Native Gemini Content objects
+        # 1. Map prior history turns to Native Gemini Content objects.
+        #    Each historical user turn is rebuilt WITH its documents, not just its text.
         if structured_history:
             for msg in structured_history:
                 # 'user' or 'assistant' -> 'user' or 'model' for Gemini
                 role = "user" if msg["role"] == "user" else "model"
-                payload.append(types.Content(role=role, parts=[types.Part.from_text(text=msg["content"])]))
+                parts = []
+                if role == "user":
+                    hist_doc_ids = doc_ids_from_message(msg)
+                    if hist_doc_ids:
+                        try:
+                            parts.extend(await build_parts(self, hist_doc_ids))
+                        except Exception:
+                            logger.exception("Failed to rehydrate history attachments; continuing with text only")
+                parts.append(types.Part.from_text(text=msg["content"]))
+                payload.append(types.Content(role=role, parts=parts))
 
         # 2. Build current turn (Context Injection)
         final_prompt = ""
@@ -191,16 +267,26 @@ class GeminiClient:
 
         # 3. Create the parts for the current user turn
         current_turn_parts = []
-        
-        # Add any file attachments first
+
+        # Documents attached to THIS message, from the durable store
+        if document_ids:
+            current_turn_parts.extend(await build_parts(self, document_ids))
+
+        # Legacy inline attachments (pre-document_ids clients)
         if attachments:
-            final_prompt += f"\n\n[System Note: The user has attached {len(attachments)} file(s) to this message. Please analyze the provided file(s) to answer their question.]"
             for file in attachments:
                 uri = file.uri if hasattr(file, 'uri') else file.get('uri')
                 mime_type = file.mime_type if hasattr(file, 'mime_type') else file.get('mime_type')
                 if uri and mime_type:
                     current_turn_parts.append(types.Part.from_uri(file_uri=uri, mime_type=mime_type))
-                    
+
+        attached_count = len(document_ids or []) + len(attachments or [])
+        if attached_count:
+            final_prompt += (
+                f"\n\n[System Note: The user has attached {attached_count} file(s) to this "
+                f"message. Please analyze the provided file(s) to answer their question.]"
+            )
+
         # Add the text prompt
         current_turn_parts.append(types.Part.from_text(text=final_prompt))
 
@@ -220,7 +306,13 @@ class GeminiClient:
             config=config
         )
 
-        answer = response.text.strip()
+        # response.text is None whenever the model returns no usable candidate (SAFETY,
+        # RECITATION, MAX_TOKENS, ...). Calling .strip() on it raised a bare AttributeError
+        # that surfaced to the user as a generic 500 with no clue what happened.
+        answer = (response.text or "").strip()
+        if not answer:
+            raise EmptyLLMResponse(_finish_reason(response))
+
         logger.info(f"📥 Main LLM responded ({len(answer):,} chars)")
 
         return {
@@ -229,6 +321,156 @@ class GeminiClient:
             "context_length": len(context_markdown),
             "prompt_length": len(final_prompt),
         }
+
+    async def compare_documents(self, doc_parts: list, labels: list[str], language_hint: str = "") -> Dict[str, Any]:
+        """Compares 2-4 documents and returns a structured, clause-by-clause diff.
+
+        Uses response_mime_type=application/json with an explicit schema so the result
+        can drive a real table instead of being prose the UI has to guess at.
+        """
+        schema = {
+            "type": "object",
+            "properties": {
+                "documents": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "label": {"type": "string"},
+                        },
+                        "required": ["id", "label"],
+                    },
+                },
+                "rows": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "clause": {"type": "string"},
+                            "values": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "doc_id": {"type": "string"},
+                                        "text": {"type": "string", "nullable": True},
+                                    },
+                                    "required": ["doc_id"],
+                                },
+                            },
+                            "status": {"type": "string", "enum": ["match", "differs", "missing"]},
+                            "severity": {"type": "string", "enum": ["info", "warn", "risk"]},
+                            "note": {"type": "string", "nullable": True},
+                        },
+                        "required": ["clause", "values", "status", "severity"],
+                    },
+                },
+                "summary": {"type": "string"},
+            },
+            "required": ["documents", "rows", "summary"],
+        }
+
+        instruction = "Compare the attached documents:\n" + "\n".join(
+            f"- Document {chr(65 + i)}: {label}" for i, label in enumerate(labels)
+        )
+        if language_hint:
+            instruction += f"\n\nRespond in: {language_hint}"
+
+        parts = list(doc_parts) + [types.Part.from_text(text=instruction)]
+        config = types.GenerateContentConfig(
+            temperature=0.1,
+            system_instruction=COMPARE_SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            response_schema=schema,
+        )
+
+        response = await self._generate_with_retry(
+            model=self.main_model,
+            contents=[types.Content(role="user", parts=parts)],
+            config=config,
+        )
+
+        raw = (response.text or "").strip()
+        if not raw:
+            raise EmptyLLMResponse(_finish_reason(response))
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            logger.error(f"Comparison returned non-JSON: {raw[:300]}")
+            raise EmptyLLMResponse("MALFORMED_JSON") from e
+
+    async def draft_contract(
+        self, template_text: str, contract_type: str, answers: Dict[str, Any],
+        legal_context: str = "", language: str = "uz",
+    ) -> Dict[str, Any]:
+        """Generates a contract as structured JSON, ready for the .docx renderer."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "intro": {"type": "string", "nullable": True},
+                "sections": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "number": {"type": "integer"},
+                            "heading": {"type": "string"},
+                            "body": {"type": "string"},
+                        },
+                        "required": ["number", "heading", "body"],
+                    },
+                },
+                "signature_blocks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "party_role": {"type": "string"},
+                            "party_name": {"type": "string"},
+                        },
+                        "required": ["party_role", "party_name"],
+                    },
+                },
+                "chat_note": {"type": "string"},
+            },
+            "required": ["title", "sections", "chat_note"],
+        }
+
+        details = "\n".join(f"- {k}: {v}" for k, v in (answers or {}).items() if v) or "(none supplied)"
+        prompt = (
+            f"Contract type: {contract_type}\n"
+            f"Output language: {language}\n\n"
+            f"## TEMPLATE SKELETON\n{template_text}\n\n"
+            f"## USER-SUPPLIED DETAILS\n{details}\n"
+        )
+        if legal_context:
+            prompt += f"\n## LEGAL CONTEXT FROM THE UZBEKISTAN DATABASE\n{legal_context}\n"
+        prompt += (
+            "\nDraft the complete contract. `chat_note` is a short friendly message to show "
+            "next to the download link, mentioning anything the user still needs to fill in."
+        )
+
+        config = types.GenerateContentConfig(
+            temperature=0.2,
+            system_instruction=DRAFT_SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            response_schema=schema,
+        )
+
+        response = await self._generate_with_retry(
+            model=self.main_model, contents=prompt, config=config,
+        )
+
+        raw = (response.text or "").strip()
+        if not raw:
+            raise EmptyLLMResponse(_finish_reason(response))
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            logger.error(f"Draft returned non-JSON: {raw[:300]}")
+            raise EmptyLLMResponse("MALFORMED_JSON") from e
 
     async def summarize_archive(
         self,

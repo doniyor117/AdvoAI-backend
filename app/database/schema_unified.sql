@@ -201,4 +201,34 @@ ALTER TABLE public.chat_messages ADD COLUMN IF NOT EXISTS attachments JSONB DEFA
 ALTER TABLE public.router_analytics ADD COLUMN IF NOT EXISTS router_time_ms INTEGER;
 ALTER TABLE public.router_analytics ADD COLUMN IF NOT EXISTS llm_time_ms INTEGER;
 
+-- V6: Durable document store for chat attachments.
+--
+-- Previously an attachment existed only as (a) a Gemini Files handle, which is scoped to
+-- the API key that uploaded it and expires after 48h, and (b) an opaque blob in R2.
+-- Nothing held the document's TEXT, so conversation history could never be rebuilt and
+-- the model asked users to re-upload files that were plainly visible in the chat.
+--
+-- kind='text'  -> converted to Markdown at upload; `extracted_text` is the source of
+--                 truth and is inlined into the prompt. Never touches the Files API,
+--                 so it cannot expire or be locked to the wrong API key.
+-- kind='media' -> PDFs and images, which Gemini must read natively. The Files handle is
+--                 cached with its real expiry and re-minted from R2 on demand.
+CREATE TABLE IF NOT EXISTS public.uploaded_documents (
+    id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id           uuid REFERENCES public.users(id) ON DELETE SET NULL,
+    display_name      text NOT NULL,
+    original_mime     text NOT NULL,
+    kind              text NOT NULL CHECK (kind IN ('text', 'media')),
+    extracted_text    text,
+    s3_key            text,
+    gemini_uri        text,
+    gemini_name       text,
+    gemini_mime       text,
+    gemini_expires_at timestamptz,
+    created_at        timestamptz DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_uploaded_documents_user
+    ON public.uploaded_documents (user_id, created_at DESC);
+
 COMMIT;

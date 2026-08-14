@@ -2,9 +2,23 @@
 
 This document serves as a comprehensive technical audit of the current state of the AdvoAI backend, highlighting recent architectural upgrades, design patterns, security measures, and areas for potential future improvement.
 
+> **Status:** refreshed after the attachment-pipeline repair. Earlier revisions of this
+> document described a 50MB upload cap and an `asyncpg.Pool` usage pattern that did not
+> match `connection.py`; both are corrected below. Verify against the code before
+> trusting any section.
+
 ---
 
 ## 1. Architectural Highlights
+
+### Durable Document Store (`uploaded_documents`)
+Attachments used to exist only as a Gemini Files handle — scoped to the uploading API key
+and expiring after 48h — plus an opaque R2 blob. Nothing held the document's text, so
+conversation history could not be rebuilt and the model asked users to re-upload files
+that were visible in the chat. `uploaded_documents` now holds the extracted Markdown for
+text documents and a cached, expiry-aware handle for media. `app/services/attachments.py:
+build_parts()` is the single place that turns a stored document into prompt parts, and it
+is used for **both** the current turn and replayed history.
 
 ### Agentic RAG Implementation
 The core chat pipeline has been successfully upgraded to an "Agentic RAG" pattern.
@@ -17,7 +31,7 @@ Heavy LLM operations and blocking I/O have been successfully decoupled from the 
 - **Thread Offloading (`main_ingest.py`)**: Synchronous network calls (e.g. `requests.get` via `LexParser`) and CPU-intensive parsing (`BeautifulSoup`, `MarkItDown`) are wrapped in `asyncio.to_thread()` so they do not block the Uvicorn event loop during document ingestion.
 
 ### Robust LLM Communication
-- **Exponential Backoff (`llm_client.py: _generate_with_retry`)**: A custom retry loop using exponential backoff (1s, 2s, 4s) ensures that the system gracefully recovers from intermittent network failures or LLM API rate limits.
+- **Exponential Backoff (`llm_client.py: _generate_with_retry`)**: A custom retry loop using exponential backoff (1s, 2s, 4s) recovers from intermittent network failures and rate limits. Client errors (4xx other than 429) fail fast via `_is_retryable` — retrying a deterministic 403 previously cost ~15s per request.
 
 ---
 
@@ -26,7 +40,7 @@ Heavy LLM operations and blocking I/O have been successfully decoupled from the 
 The entire backend operates on a **fully asynchronous, non-blocking architecture** designed for high concurrency and zero event-loop blocking.
 
 ### `app/database/`
-- **`connection.py`**: Manages a global `asyncpg.Pool` initialized during the FastAPI lifespan (`@asynccontextmanager`). It uses `yield pool` so all routers can safely borrow connections. Context managers like `get_db_connection()` are used across all queries to ensure safe releasing of connections back to the pool.
+- **`connection.py`**: Manages a global `asyncpg.Pool` initialized during the FastAPI lifespan. Queries go through the `get_connection()` async context manager, which yields a psycopg-style cursor shim; `_adapt_sql` rewrites `%s`/`%(name)s` placeholders into asyncpg's `$n` form. Note: a literal `%` in SQL would corrupt that rewrite.
 - **`queries.py` & `schema_unified.sql`**: Contains all SQL functions parameterized securely. The schema uses `pgvector` with HNSW indexes (`m = 16, ef_construction = 64`) for extremely fast, high-recall vector search. 
 
 ### `app/services/`
@@ -70,7 +84,7 @@ The application exposes the following RESTful endpoints grouped by their respect
 
 ### Chat (`/api/chat`)
 - `POST /api/chat/`: The core Agentic RAG chat endpoint. Accepts a JSON payload containing the user's `question`, an optional `session_id`, and `attachments`. Automatically routes the query, retrieves context, and responds. Rate-limited and utilizes background tasks for history compression.
-- `POST /api/chat/upload`: Handles `multipart/form-data` uploads. Enforces a 50MB file size limit. It asynchronously offloads disk I/O to a background thread to prevent blocking, and streams the file securely to Google's GenAI servers via the File API. Returns a `URI` used for multimodal analysis.
+- `POST /api/chat/upload`: Handles `multipart/form-data` uploads. Enforces a **10MB** file size limit (`MAX_FILE_SIZE_MB` in `chat.py`). Offloads disk I/O to a thread, then splits by document class: text-ish formats (docx/doc/rtf/csv/html/txt/md) are converted to Markdown and stored in `uploaded_documents.extracted_text`, while media (PDF, images) go to the Gemini Files API. Returns a `document_id`.
 
 ### Sessions (`/api/sessions`)
 - `GET /api/sessions/`: Lists all chat sessions belonging to the authenticated user.

@@ -511,15 +511,52 @@ async def ask_advoai(
             session_summary = session.get("session_summary", "")
             recent_messages = await get_session_messages(session_id, limit=LLM_HISTORY_MESSAGES)
 
+        # ── 1b. Resolve this turn's attachments (needed BEFORE routing) ──
+        document_ids = [att.document_id for att in (request.attachments or []) if att.document_id]
+        legacy_attachments = [att for att in (request.attachments or [])
+                              if not att.document_id and att.uri]
+
+        # document_ids arrive straight from the client, so ownership must be checked
+        # here. (History rehydration needs no check — session ownership already gates it.)
+        if document_ids:
+            forbidden = await documents_not_owned_by(document_ids, user["id"] if user else None)
+            if forbidden:
+                raise HTTPException(
+                    status_code=403,
+                    detail="One or more attached files are not available to you.",
+                )
+
         # ── 2. Intent Routing ───────────────────────────────
-        # If user attached files, let the router know in the question text
+        # The router used to receive only "[User attached N file(s)]" — a count, never
+        # content. It therefore could not tell an employment contract from a selfie, and
+        # bucketed attachment turns into an intent that skipped retrieval entirely. Give
+        # it the actual text so it can classify and build a search query from the subject
+        # matter of the document.
+        document_excerpts = []
+        if document_ids:
+            try:
+                for doc in await get_uploaded_documents(document_ids):
+                    if doc.get("extracted_text"):
+                        document_excerpts.append({
+                            "display_name": doc["display_name"],
+                            "text": doc["extracted_text"],
+                        })
+            except Exception:
+                logger.exception("Could not load document excerpts for routing; routing on text alone")
+
         router_question = request.question
-        if request.attachments:
+        if request.attachments and not document_excerpts:
+            # Images and PDFs have no extracted text — fall back to the old hint so the
+            # router at least knows something is attached.
             router_question += f" [User attached {len(request.attachments)} file(s)]"
 
         import time
         start_router = time.monotonic()
-        routing_data = await client.route_query(router_question, recent_messages=recent_messages if session_id else None)
+        routing_data = await client.route_query(
+            router_question,
+            recent_messages=recent_messages if session_id else None,
+            document_excerpts=document_excerpts,
+        )
         router_time_ms = int((time.monotonic() - start_router) * 1000)
         
         intent = routing_data.get("intent", "legal_rag")
@@ -562,21 +599,26 @@ async def ask_advoai(
 
         # ── 3. RAG retrieval pipeline (if needed) ───────────
         rag_result = {}
-        if intent == "create_contract":
-            from app.services.templates import get_template
-            contract_type = routing_data.get("contract_type", "")
-            template_text = get_template(contract_type)
-            rag_result = {
-                "context_markdown": f"## RECOMMENDED TEMPLATE FOR DRAFTING\n{template_text}\n\nNote to AI: Use this template as a starting point. Adjust it based on the user's specific details or requests.",
-                "parent_documents": []
-            }
-        elif intent == "compare_contracts":
-            # For comparison, we rely entirely on the attachments provided by the user.
-            rag_result = {
-                "context_markdown": "Note to AI: The user wants to compare the attached documents. Focus entirely on analyzing the attachments.",
-                "parent_documents": []
-            }
-        elif not is_conversational:
+        # The router used to be able to return `create_contract` / `compare_contracts`,
+        # and both branches SKIPPED retrieval. In production that made them a dumping
+        # ground for any turn with an attachment: "Bu shartnomada qonunga zid shartlar
+        # bormi?" ("does this contract contain unlawful clauses?") was classified
+        # compare_contracts and answered with ZERO statutes in context — 17% of all turns
+        # received no legal grounding this way. Compare and Draft are now explicit
+        # endpoints in documents.py, so the router no longer needs to guess them and
+        # both intents have been removed from ROUTER_SYSTEM_PROMPT.
+        #
+        # A stale model or a cached prompt override could still emit them, so treat any
+        # non-conversational intent as a retrieval intent rather than trusting the label.
+        if intent in ("create_contract", "compare_contracts"):
+            logger.warning(
+                f"Router returned legacy intent '{intent}'; treating as legal_rag. "
+                f"Check custom_router_prompt if this persists."
+            )
+            intent = "legal_rag"
+            is_conversational = False
+
+        if not is_conversational:
             # We always run RAG if it's not conversational, even with attachments!
             # Gemini 3 has a massive context window, so token overflow is not a concern.
             rag_result = await retrieve_context(
@@ -608,24 +650,11 @@ async def ask_advoai(
             parents.extend(url_parents)
             rag_result["parent_documents"] = parents
 
-        # ── 4. Resolve attachments ──────────────────────────
-        # Documents from the durable store need no verification: text documents are read
+        # ── 4. Verify legacy inline attachments ─────────────
+        # document_ids were resolved and ownership-checked in §1b (the router needs them).
+        # Documents from the durable store need no liveness check: text documents are read
         # straight from Postgres, and media handles are re-minted on demand inside
-        # build_parts(). Only legacy inline Gemini URIs still need a liveness check.
-        document_ids = [att.document_id for att in (request.attachments or []) if att.document_id]
-        legacy_attachments = [att for att in (request.attachments or [])
-                              if not att.document_id and att.uri]
-
-        # document_ids arrive straight from the client, so ownership must be checked
-        # here. (History rehydration needs no check — session ownership already gates it.)
-        if document_ids:
-            forbidden = await documents_not_owned_by(document_ids, user["id"] if user else None)
-            if forbidden:
-                raise HTTPException(
-                    status_code=403,
-                    detail="One or more attached files are not available to you.",
-                )
-
+        # build_parts(). Only legacy inline Gemini URIs still need one.
         for att in legacy_attachments:
             if not att.name:
                 continue

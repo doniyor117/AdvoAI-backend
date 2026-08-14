@@ -128,10 +128,26 @@ class GeminiClient:
                 await asyncio.sleep(wait_time)
                 keys_tried = 1 # Reset after sleeping
 
-    async def route_query(self, question: str, recent_messages: list = None) -> Dict[str, str]:
+    # How much of an attached document the router gets to see. Enough to identify the
+    # document type and subject matter; small enough to keep routing fast and cheap.
+    ROUTER_DOC_EXCERPT_CHARS = 2000
+
+    async def route_query(
+        self,
+        question: str,
+        recent_messages: list = None,
+        document_excerpts: list = None,
+    ) -> Dict[str, str]:
         """
         Uses gemma-4-31b-it to classify the query as 'conversational' or 'legal_rag'.
-        Returns a dict: {"intent": "...", "search_query": "..."}
+
+        `document_excerpts` is a list of {display_name, text} for files attached to THIS
+        turn. Without it the router only knew a file count, so "is this legal?" plus an
+        employment contract was indistinguishable from "is this legal?" plus a selfie —
+        and such turns were being routed away from RAG, answering legal questions with
+        no statutes in context.
+
+        Returns a dict: {"intent": ..., "search_query": ..., "ideal_top_k": ...}
         """
         logger.info("🧠 Routing query intent...")
         
@@ -141,13 +157,27 @@ class GeminiClient:
             thinking_config=types.ThinkingConfig(thinking_level="MINIMAL")
         )
         
-        prompt = question
+        sections = []
         if recent_messages:
             history_text = "\n".join(
-                f"{msg['role'].capitalize()}: {msg['content']}" 
+                f"{msg['role'].capitalize()}: {msg['content']}"
                 for msg in recent_messages
             )
-            prompt = f"Recent Conversation History:\n{history_text}\n\nCurrent Query: {question}"
+            sections.append(f"Recent Conversation History:\n{history_text}")
+
+        for doc in (document_excerpts or []):
+            text = (doc.get("text") or "").strip()
+            if not text:
+                continue
+            excerpt = text[: self.ROUTER_DOC_EXCERPT_CHARS]
+            if len(text) > self.ROUTER_DOC_EXCERPT_CHARS:
+                excerpt += "\n[...truncated...]"
+            sections.append(
+                f"Attached document excerpt ({doc.get('display_name', 'document')}):\n{excerpt}"
+            )
+
+        sections.append(f"Current Query: {question}")
+        prompt = "\n\n".join(sections) if len(sections) > 1 else question
 
         response = await self._generate_with_retry(
             model=self.router_model,

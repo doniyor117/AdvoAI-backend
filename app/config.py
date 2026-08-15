@@ -56,6 +56,8 @@ class Settings(BaseSettings):
     FREE_DAILY_LIMIT: int = 20
 
     # ── Web Search (optional; the toggle degrades to a no-op if unset) ─────
+    # Tried in this order: Exa, then Tavily, then Serper.
+    EXA_API_KEY: str | None = None
     TAVILY_API_KEY: str | None = None
     SERPER_API_KEY: str | None = None
 

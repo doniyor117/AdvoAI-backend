@@ -12,18 +12,19 @@ inserting — the same check `chat.py` performs.
 import logging
 import os
 import shutil
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request, Response
 from pydantic import BaseModel, Field
 
 from app.database.queries import (
     get_session_by_id, create_session, insert_message,
     get_uploaded_documents, documents_not_owned_by, create_uploaded_document,
+    resolve_legal_document, fetch_document_parts_page, fetch_document_parts_meta,
 )
 from app.middleware import require_rate_limit
 from app.services.attachments import build_parts
-from app.services.docgen import render_contract, contract_to_markdown, DOCX_MIME
+from app.services.docgen import render_contract, render_contract_pdf, contract_to_markdown, DOCX_MIME, PDF_MIME
 from app.services.llm_client import get_llm_client, EmptyLLMResponse
 from app.services.rag_pipeline import retrieve_context
 from app.services.storage import upload_file_to_s3
@@ -34,6 +35,11 @@ logger = logging.getLogger(__name__)
 
 MIN_COMPARE_DOCS = 2
 MAX_COMPARE_DOCS = 4
+
+# A full legal code can run 100-250 parts at ~20k chars each — paginate rather than
+# materialize the whole thing on every panel open.
+DEFAULT_FULL_DOC_PART_LIMIT = 20
+MAX_FULL_DOC_PART_LIMIT = 50
 
 
 class CompareRequest(BaseModel):
@@ -47,6 +53,7 @@ class DraftRequest(BaseModel):
     answers: Dict[str, Any] = Field(default_factory=dict)
     session_id: Optional[str] = Field(default=None)
     language: str = Field(default="uz")
+    format: Literal["docx", "pdf"] = Field(default="docx")
 
 
 def _require_user(user: Optional[dict]) -> dict:
@@ -190,11 +197,24 @@ async def draft_contract(request: DraftRequest, user: Optional[dict] = Depends(r
 
     tmp_dir = None
     try:
-        path = render_contract(contract)
+        if request.format == "pdf":
+            try:
+                path = render_contract_pdf(contract)
+            except Exception:
+                logger.exception("PDF rendering failed")
+                raise HTTPException(
+                    status_code=502,
+                    detail="The PDF could not be generated. Please try again, or choose Word format.",
+                )
+            mime_type = PDF_MIME
+        else:
+            path = render_contract(contract)
+            mime_type = DOCX_MIME
+
         tmp_dir = os.path.dirname(path)
         file_name = os.path.basename(path)
 
-        s3_key = await upload_file_to_s3(path, file_name, DOCX_MIME)
+        s3_key = await upload_file_to_s3(path, file_name, mime_type)
         if not s3_key:
             raise HTTPException(
                 status_code=503,
@@ -209,7 +229,7 @@ async def draft_contract(request: DraftRequest, user: Optional[dict] = Depends(r
         document_id = await create_uploaded_document(
             user_id=user["id"],
             display_name=file_name,
-            original_mime=DOCX_MIME,
+            original_mime=mime_type,
             kind="text",
             extracted_text=markdown,
             s3_key=s3_key,
@@ -227,7 +247,7 @@ async def draft_contract(request: DraftRequest, user: Optional[dict] = Depends(r
             attachments=[{
                 "document_id": document_id,
                 "display_name": file_name,
-                "mime_type": DOCX_MIME,
+                "mime_type": mime_type,
                 "s3_key": s3_key,
             }],
         )
@@ -236,7 +256,7 @@ async def draft_contract(request: DraftRequest, user: Optional[dict] = Depends(r
             "session_id": session_id,
             "document_id": document_id,
             "display_name": file_name,
-            "mime_type": DOCX_MIME,
+            "mime_type": mime_type,
             "s3_key": s3_key,
             "chat_note": chat_note,
             "contract": contract,
@@ -244,3 +264,48 @@ async def draft_contract(request: DraftRequest, user: Optional[dict] = Depends(r
     finally:
         if tmp_dir and os.path.isdir(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@router.get("/{key}/full/meta")
+async def get_full_legal_document_meta(key: str, user: Optional[dict] = Depends(require_rate_limit)):
+    """Part positions and sizes only — no `text` — for the InsightPanel minimap.
+
+    Fetching this instead of the full document to draw the scroll rail is what keeps
+    opening a citation from downloading a whole legal code just to place some dots.
+    """
+    _require_user(user)
+    doc = await resolve_legal_document(key)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Legal document not found.")
+
+    parts = await fetch_document_parts_meta(doc["id"])
+    return {**doc, "parts": parts, "total_parts": len(parts)}
+
+
+@router.get("/{key}/full")
+async def get_full_legal_document(
+    key: str,
+    request: Request,
+    response: Response,
+    offset: int = 0,
+    limit: int = DEFAULT_FULL_DOC_PART_LIMIT,
+    user: Optional[dict] = Depends(require_rate_limit),
+):
+    """A page of a legal document's parts, in order, for full-document viewing."""
+    _require_user(user)
+    offset = max(0, offset)
+    limit = max(1, min(limit, MAX_FULL_DOC_PART_LIMIT))
+
+    doc = await resolve_legal_document(key)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Legal document not found.")
+
+    parts, total = await fetch_document_parts_page(doc["id"], offset, limit)
+
+    etag = f'W/"{doc["id"]}-{offset}-{limit}-{total}"'
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304)
+    response.headers["ETag"] = etag
+    response.headers["Cache-Control"] = "private, max-age=60"
+
+    return {**doc, "parts": parts, "total_parts": total, "offset": offset, "limit": limit}

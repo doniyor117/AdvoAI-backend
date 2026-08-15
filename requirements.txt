@@ -13,6 +13,10 @@ lxml
 requests
 markitdown[all]
 resend
+# PINNED-IN: currently resolves only transitively through google-genai. Declared
+# directly because app.services.web_search imports it, and an unrelated pin bump
+# in google-genai's own deps could otherwise take it away at import time.
+httpx
 
 # ── Document Chunking ────────────────────────────────────────
 unstructured
@@ -42,3 +46,7 @@ email-validator
 aioboto3
 # ── Document Generation ──────────────────────────────────────
 python-docx
+# Renders contracts to PDF from HTML/CSS in-process (no Chromium, no sidecar).
+# Needs system libs installed in the Dockerfile: libpango, libpangocairo, libcairo,
+# libgdk-pixbuf.
+weasyprint

@@ -8,11 +8,9 @@ from app.ingestion.chunker import LegalUnstructuredChunker
 @patch('app.ingestion.main_ingest.get_llm_client')
 @patch('app.ingestion.main_ingest.LexParser')
 @patch('app.ingestion.main_ingest.check_duplicate', new_callable=AsyncMock)
-@patch('app.ingestion.main_ingest.insert_document', new_callable=AsyncMock)
-@patch('app.ingestion.main_ingest.insert_document_parts', new_callable=AsyncMock)
-@patch('app.ingestion.main_ingest.insert_chunks', new_callable=AsyncMock)
+@patch('app.ingestion.main_ingest.ingest_document_atomic', new_callable=AsyncMock)
 @pytest.mark.asyncio
-async def test_process_and_ingest_law(mock_insert_chunks, mock_insert_parts, mock_insert_doc, mock_check_dup, mock_extractor, mock_llm, mock_embedder):
+async def test_process_and_ingest_law(mock_ingest_atomic, mock_check_dup, mock_extractor, mock_llm, mock_embedder):
     # Setup mocks
     mock_check_dup.return_value = False
     
@@ -33,7 +31,9 @@ async def test_process_and_ingest_law(mock_insert_chunks, mock_insert_parts, moc
 
     # Mocking Embedder
     mock_embed_instance = AsyncMock()
-    mock_embed_instance.embed_chunks.return_value = [{"text": "chunk", "embedding": [0.1]}]
+    mock_embed_instance.embed_chunks.side_effect = lambda chunks, **kwargs: [
+        dict(c, embedding=[0.1]) for c in chunks
+    ]
     mock_embedder.return_value = mock_embed_instance
     
     # Execute

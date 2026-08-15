@@ -55,6 +55,10 @@ class Settings(BaseSettings):
     GUEST_MESSAGE_LIMIT: int = 3
     FREE_DAILY_LIMIT: int = 20
 
+    # ── Web Search (optional; the toggle degrades to a no-op if unset) ─────
+    TAVILY_API_KEY: str | None = None
+    SERPER_API_KEY: str | None = None
+
     # ── CORS ──────────────────────────────────────────────────
     CORS_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000"
 

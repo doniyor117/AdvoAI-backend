@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import tempfile
+from html import escape
 from typing import Any, Dict, List, Optional
 
 from docx import Document
@@ -20,6 +21,7 @@ from docx.shared import Pt, Cm
 logger = logging.getLogger(__name__)
 
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+PDF_MIME = "application/pdf"
 
 # Cyrillic-capable and present on virtually every system that opens these files.
 _BODY_FONT = "Times New Roman"
@@ -104,6 +106,88 @@ def render_contract(contract: Dict[str, Any], output_dir: Optional[str] = None) 
     os.makedirs(target_dir, exist_ok=True)
     path = os.path.join(target_dir, f"{_safe_filename(title)}.docx")
     doc.save(path)
+    logger.info(f"Rendered contract '{title}' -> {path}")
+    return path
+
+
+_PDF_STYLE = """
+    @page { size: A4; margin: 2cm 1.5cm 2cm 3cm; }
+    body { font-family: "Noto Serif", "DejaVu Serif", Georgia, serif; font-size: 12pt;
+           line-height: 1.5; color: #1a1a1a; }
+    h1 { text-align: center; font-size: 15pt; letter-spacing: 0.02em; margin-bottom: 1.5em; }
+    .intro { text-align: justify; margin-bottom: 1.5em; }
+    .section-heading { font-weight: bold; margin-top: 1.2em; margin-bottom: 0.4em; }
+    .section-body p { text-align: justify; margin: 0 0 0.6em 0; }
+    table.signatures { width: 100%; border-collapse: collapse; margin-top: 2.5em; }
+    table.signatures td { width: 50%; vertical-align: top; padding: 0 1em; }
+    table.signatures .role { font-weight: bold; }
+    table.signatures .line { margin-top: 2.5em; border-top: 1px solid #1a1a1a; width: 80%; }
+    table.signatures .caption { font-size: 9pt; color: #555; margin-top: 0.2em; }
+"""
+
+
+def _contract_html(contract: Dict[str, Any]) -> str:
+    """Renders the same section/clause model as `render_contract` to HTML for WeasyPrint.
+
+    Kept a pure string-templating function (no Jinja) — the structure is simple enough
+    that a template engine would add a dependency without buying anything.
+    """
+    title = (contract.get("title") or "Shartnoma").strip()
+    parts = [f"<h1>{escape(title.upper())}</h1>"]
+
+    intro = (contract.get("intro") or "").strip()
+    if intro:
+        parts.append(f'<p class="intro">{escape(intro)}</p>')
+
+    sections: List[Dict[str, Any]] = contract.get("sections") or []
+    for idx, section in enumerate(sections, start=1):
+        number = section.get("number") or idx
+        sec_heading = (section.get("heading") or "").strip()
+        if sec_heading:
+            label = sec_heading if re.match(r"^\s*\d+[.)]", sec_heading) else f"{number}. {sec_heading}"
+            parts.append(f'<div class="section-heading">{escape(label)}</div>')
+
+        body = (section.get("body") or "").strip()
+        body_html = "".join(
+            f"<p>{escape(p.strip())}</p>" for p in body.split("\n") if p.strip()
+        )
+        if body_html:
+            parts.append(f'<div class="section-body">{body_html}</div>')
+
+    blocks = contract.get("signature_blocks") or []
+    if blocks:
+        cells = "".join(
+            f"""<td>
+                <div class="role">{escape((b.get('party_role') or '').strip())}</div>
+                <div>{escape((b.get('party_name') or '').strip())}</div>
+                <div class="line"></div>
+                <div class="caption">(imzo / подпись)</div>
+            </td>"""
+            for b in blocks
+        )
+        parts.append(f'<table class="signatures"><tr>{cells}</tr></table>')
+
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+        <style>{_PDF_STYLE}</style></head><body>{"".join(parts)}</body></html>"""
+
+
+def render_contract_pdf(contract: Dict[str, Any], output_dir: Optional[str] = None) -> str:
+    """Renders a contract dict into a .pdf and returns the local path.
+
+    Pure and network-free like `render_contract`, from the same structured contract
+    JSON — no Chromium, no sidecar service, no network hop. Import is local to this
+    function so a WeasyPrint import failure can't break DOCX generation, which has no
+    dependency on it.
+    """
+    from weasyprint import HTML
+
+    title = (contract.get("title") or "Shartnoma").strip()
+    html = _contract_html(contract)
+
+    target_dir = output_dir or tempfile.mkdtemp(prefix="advoai_docgen_")
+    os.makedirs(target_dir, exist_ok=True)
+    path = os.path.join(target_dir, f"{_safe_filename(title)}.pdf")
+    HTML(string=html).write_pdf(path)
     logger.info(f"Rendered contract '{title}' -> {path}")
     return path
 

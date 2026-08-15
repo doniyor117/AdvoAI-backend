@@ -17,6 +17,10 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     libpq-dev \
     gcc \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
+    libcairo2 \
+    libgdk-pixbuf2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 USER user
 

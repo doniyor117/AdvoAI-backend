@@ -33,7 +33,11 @@ from app.database.queries import (
     documents_not_owned_by, delete_message
 )
 from app.services.converter import fetch_and_convert_url
+from app.services.web_search import perform_web_search
+from app.services.docgen import render_contract, render_contract_pdf, contract_to_markdown, DOCX_MIME, PDF_MIME
+from app.services.templates import get_template
 import re
+import shutil
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -163,7 +167,12 @@ def _citation_url(doc: dict) -> str:
 
 
 def _build_citations(rag_result: dict, is_conversational: bool) -> list:
-    """One entry per matched document part, deduplicated by part id."""
+    """One entry per matched document part, deduplicated by part id.
+
+    `kind` ('corpus' | 'web') tells the frontend how to open a citation: corpus
+    citations resolve through `/api/documents/{id}/full`, web citations open
+    `source_url` directly and must never be mistaken for a vetted legal source.
+    """
     if is_conversational:
         return []
     seen, out = set(), []
@@ -178,6 +187,7 @@ def _build_citations(rag_result: dict, is_conversational: bool) -> list:
             "title": _citation_label(doc),
             "source_url": _citation_url(doc),
             "text": doc.get("full_markdown") or "",
+            "kind": doc.get("kind", "corpus"),
         })
     return out
 
@@ -284,6 +294,7 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = Field(default=None, description="Chat session ID for conversation continuity.")
     top_k: int = Field(default=5, description="Number of chunks to retrieve.")
     attachments: Optional[List[FileAttachment]] = Field(default=None, description="Optional list of attached files.")
+    use_web_search: bool = Field(default=False, description="Augment retrieval with live web search results.")
 
 async def _background_history_maintenance(
     session_id: str,
@@ -340,6 +351,79 @@ async def _background_history_maintenance(
 
     except Exception as se:
         logger.warning(f"History update background task failed: {se}")
+
+async def _run_generate_contract_tool(client: Any, args: Dict[str, Any], user: Optional[dict]) -> Dict[str, Any]:
+    """Executes a `generate_contract` tool call: drafts, renders, persists, and returns
+    the reply text (the draft's own `chat_note`) plus the file attachment to show.
+
+    Reuses the exact same drafting/rendering/persistence path as `POST
+    /api/documents/draft` — the only difference is where the request originated.
+    """
+    contract_type = (args.get("contract_type") or "").strip() or "General Agreement"
+    answers = args.get("answers") or {}
+    if not isinstance(answers, dict):
+        answers = {}
+    language = args.get("language") or "uz"
+    fmt = args.get("format") if args.get("format") in ("docx", "pdf") else "docx"
+
+    template_text = get_template(contract_type)
+
+    legal_context = ""
+    try:
+        rag = await retrieve_context(
+            question=f"{contract_type} shartnoma majburiy shartlari talablari",
+            top_k=3,
+        )
+        legal_context = rag.get("context_markdown", "") or ""
+    except Exception:
+        logger.exception("RAG lookup failed while tool-drafting; continuing without legal context")
+
+    contract = await client.draft_contract(
+        template_text=template_text,
+        contract_type=contract_type,
+        answers=answers,
+        legal_context=legal_context,
+        language=language,
+    )
+
+    tmp_dir = None
+    try:
+        if fmt == "pdf":
+            path = render_contract_pdf(contract)
+            mime_type = PDF_MIME
+        else:
+            path = render_contract(contract)
+            mime_type = DOCX_MIME
+        tmp_dir = os.path.dirname(path)
+        file_name = os.path.basename(path)
+
+        s3_key = await upload_file_to_s3(path, file_name, mime_type)
+        if not s3_key:
+            raise RuntimeError("Document storage is not configured")
+
+        markdown = contract_to_markdown(contract)
+        document_id = await create_uploaded_document(
+            user_id=user["id"] if user else None,
+            display_name=file_name,
+            original_mime=mime_type,
+            kind="text",
+            extracted_text=markdown,
+            s3_key=s3_key,
+        )
+
+        return {
+            "chat_note": contract.get("chat_note") or "Here is your draft. Please review it carefully.",
+            "attachment": {
+                "document_id": document_id,
+                "display_name": file_name,
+                "mime_type": mime_type,
+                "s3_key": s3_key,
+            },
+        }
+    finally:
+        if tmp_dir and os.path.isdir(tmp_dir):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
 
 @router.post("/upload")
 async def upload_file(
@@ -437,8 +521,10 @@ async def upload_file(
         is_text_doc = markdown_text is not None and markdown_text.strip() != ""
         kind = "text" if is_text_doc else "media"
 
-        # ── 5. Persist to S3/R2 (used for previews and for media re-minting) ──
-        s3_key = await upload_file_to_s3(upload_path, upload_display_name, upload_mime)
+        # ── 5. Persist the ORIGINAL file to S3/R2 (used for faithful previews/
+        # downloads and for media re-minting) — never the converted Markdown, or a
+        # .docx upload's S3 copy would silently be a .md file. ──
+        s3_key = await upload_file_to_s3(original_tmp_path, display_name, base_mime)
         if not s3_key and not is_text_doc:
             logger.warning(
                 f"S3/R2 is not configured — media file '{display_name}' has no durable copy "
@@ -466,7 +552,9 @@ async def upload_file(
         document_id = await create_uploaded_document(
             user_id=user["id"] if user else None,
             display_name=display_name,   # always the ORIGINAL filename
-            original_mime=upload_mime,
+            original_mime=base_mime,     # always the ORIGINAL mime, even when `kind='text'`
+                                          # holds a Markdown conversion — the S3 copy is the
+                                          # real file, and previews must match its actual bytes
             kind=kind,
             extracted_text=markdown_text if is_text_doc else None,
             s3_key=s3_key,
@@ -610,7 +698,13 @@ async def ask_advoai(
                 ideal_top_k = int(global_top_k)
                 logger.info(f"Overriding Top-K with global setting: {ideal_top_k}")
         
-        is_conversational = (intent == "conversational")
+        # "document_request" (drafting) skips retrieval exactly like conversational does:
+        # the legal corpus rarely matches a drafting request directly, so routing it
+        # through the RAG no-results guard would bail out before the model ever gets a
+        # chance to call the generate_contract tool. The tool's own execution does its
+        # own targeted retrieve_context() lookup regardless (see
+        # _run_generate_contract_tool), so no grounding is lost by skipping it here.
+        is_conversational = intent in ("conversational", "document_request")
         logger.info(f"Query routed as: {intent} | Optimized Search Query: {search_query} | Ideal Top-K: {ideal_top_k} | Router Time: {router_time_ms}ms | Router Model: {client.router_model}")
 
 
@@ -656,6 +750,18 @@ async def ask_advoai(
             intent = "legal_rag"
             is_conversational = False
 
+        # ── 3.5 Optional live web search ─────────────────────
+        # Skipped on conversational turns: nothing is retrieved for them, so a web
+        # result injected there would be cited with no corresponding grounding check —
+        # the same false-provenance shape as showing a citation for an unretrieved
+        # answer. Guests can't spend the API key's search quota.
+        web_parents: list = []
+        if request.use_web_search and not is_conversational and user is not None:
+            try:
+                web_parents = await perform_web_search(search_query)
+            except Exception:
+                logger.exception("Web search failed; continuing without it")
+
         if not is_conversational:
             # We always run RAG if it's not conversational, even with attachments!
             # Gemini 3 has a massive context window, so token overflow is not a concern.
@@ -664,8 +770,8 @@ async def ask_advoai(
                 top_k=ideal_top_k,
             )
 
-            # Guard: no documents found and no URL context
-            if not rag_result.get("parent_documents") and not url_contexts:
+            # Guard: no corpus documents, no URL context, no web results
+            if not rag_result.get("parent_documents") and not url_contexts and not web_parents:
                 # If there are attachments, we still want the LLM to process them!
                 if not request.attachments:
                     return {
@@ -676,6 +782,18 @@ async def ask_advoai(
                         "chunks_used": 0,
                         "intent": intent,
                     }
+
+        # Inject web search results into the rag result
+        if web_parents:
+            web_markdown = "\n\n".join(
+                f"#### {p['title']}\n{p['full_markdown']}" for p in web_parents
+            )
+            existing_context = rag_result.get("context_markdown", "")
+            rag_result["context_markdown"] = (
+                f"{existing_context}\n\n### Live Web Search Results\n\n{web_markdown}"
+                if existing_context else f"### Live Web Search Results\n\n{web_markdown}"
+            )
+            rag_result["parent_documents"] = rag_result.get("parent_documents", []) + web_parents
 
         # Inject URL context into the rag result
         if url_contexts:
@@ -785,6 +903,26 @@ async def ask_advoai(
                 )
             raise
 
+        # ── 5b-2. Execute a document-generation tool call, if the model made one ──
+        # Two-request sequence, not two turns: `ask()` above already spent its one
+        # request deciding whether to call the tool (Gemini rejects `tools` and
+        # `response_schema` on the same request); this is the second request, which
+        # fills in the structured contract. `chat_note` from that call IS the reply —
+        # no third "narrate the result" call is needed.
+        generated_attachment = None
+        tool_call = llm_result.get("tool_call")
+        if tool_call and tool_call.get("name") == "generate_contract":
+            try:
+                generated = await _run_generate_contract_tool(client, tool_call.get("args") or {}, user)
+                llm_result["answer"] = generated["chat_note"]
+                generated_attachment = generated["attachment"]
+            except Exception:
+                logger.exception("generate_contract tool call failed")
+                llm_result["answer"] = (
+                    "I couldn't generate the document just now. Please try again, or "
+                    "describe what you need and I'll draft it."
+                )
+
         # ── 5c. Save assistant reply & run history maintenance ─
         if session_id:
             try:
@@ -793,6 +931,7 @@ async def ask_advoai(
                 await insert_message(
                     session_id, "assistant", llm_result["answer"],
                     sources=safe_citations_for_storage(rag_result, is_conversational),
+                    attachments=[generated_attachment] if generated_attachment else None,
                 )
 
                 # Check sliding window size and summarize in background
@@ -832,6 +971,7 @@ async def ask_advoai(
             "answer": llm_result["answer"],
             "model_used": llm_result["model"],
             "citations": safe_citations,
+            "attachments": [generated_attachment] if generated_attachment else [],
             "session_id": session_id,
             "intent": intent,
             "metadata": {

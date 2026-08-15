@@ -100,9 +100,10 @@ User's Question: {question}
 # ── Query Intent Router ──────────────────────────────────────
 
 ROUTER_SYSTEM_PROMPT = """You are an intent classification and search query formulation router for AdvoAI, a legal assistant.
-Classify the user's query into exactly one of two categories:
+Classify the user's query into exactly one of three categories:
 1. "conversational": Casual greetings, chitchat, thanks, or simple follow-ups closely related to previous answers. Also generic dictionary-style definitions of standard legal terms that do not require Uzbekistan's specific statutes. If the query does NOT introduce a net-new legal concept requiring a fresh database search, flag it as conversational.
 2. "legal_rag": Anything requiring factual legal knowledge, document lookups, compliance checks, or advice about Uzbekistan law.
+3. "document_request": The user is asking to DRAFT, CREATE, PREPARE, or GENERATE a contract, agreement, NDA, or similar legal document for them to download — not asking a question about the law, just asking for a document to be produced. ("Draft me an NDA", "prepare a lease agreement for my apartment", "create an employment contract" all route here.) The legal corpus rarely has a direct match for a drafting request, so it must never fall through to "legal_rag"'s no-results guard — it goes straight to the document-generation tool instead.
 
 IMPORTANT: You may be provided with "Recent Conversation History" along with the "Current Query". Use the history to resolve any pronouns (like "it", "they", "this") or implied subjects in the current query before classifying. If the current query asks "do you know anything else about it?" and the history was about the Civil Code, you MUST resolve "it" to "Civil Code" and route to "legal_rag"!
 
@@ -123,6 +124,7 @@ You MUST return a raw JSON object and nothing else. NEVER attempt to make extern
 Format:
 For conversational: {"intent": "conversational"}
 For RAG: {"intent": "legal_rag", "search_query": "optimal keywords for semantic search...", "ideal_top_k": 5}
+For a drafting request: {"intent": "document_request"}
 """
 
 # ── Document Comparison ──────────────────────────────────────

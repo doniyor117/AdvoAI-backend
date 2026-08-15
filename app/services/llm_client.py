@@ -34,6 +34,57 @@ from app.services.prompts import (
 logger = logging.getLogger(__name__)
 
 
+# ── Document generation as a tool call ───────────────────────
+#
+# The Gemini API rejects `tools` and `response_schema` on the same request (400
+# INVALID_ARGUMENT on tool_config.function_calling_config.mode) — a platform limit,
+# not a version gap. So drafting a contract mid-conversation is two requests, not one:
+#   1. This declaration is attached to the normal chat turn (ask(), below). If the
+#      model decides the user wants a document, it returns a FunctionCall instead of
+#      text, with whatever it could infer from the conversation so far.
+#   2. draft_contract_from_tool_call() below makes a second, schema-constrained
+#      request (no tools) to fill in the rest, reusing draft_contract()'s schema and
+#      prompt shape — including `chat_note`, which doubles as the reply shown to the
+#      user, so there is no need for a third "narrate the result" call.
+GENERATE_CONTRACT_DECLARATION = types.FunctionDeclaration(
+    name="generate_contract",
+    description=(
+        "Drafts a real, downloadable contract/agreement document (.docx or .pdf) for the "
+        "user, grounded in Uzbekistan law where relevant. Call this when the user asks you "
+        "to draft, create, prepare, or generate a contract, agreement, NDA, or similar legal "
+        "document — do NOT write the contract text directly in the chat reply."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "contract_type": {
+                "type": "string",
+                "description": "e.g. 'NDA', 'Employment', 'Lease', 'Service Agreement'.",
+            },
+            "answers": {
+                "type": "object",
+                "description": (
+                    "Every concrete detail the conversation already established — party "
+                    "names, dates, amounts, terms, obligations — as flat key/value pairs. "
+                    "Leave out anything the user hasn't actually stated; unresolved fields "
+                    "are filled from the template's general drafting principles."
+                ),
+            },
+            "language": {
+                "type": "string",
+                "description": "Output language: 'uz', 'ru', or 'en'. Match the conversation's language.",
+            },
+            "format": {
+                "type": "string",
+                "enum": ["docx", "pdf"],
+                "description": "Requested file format. Default to 'docx' unless the user asked for PDF.",
+            },
+        },
+        "required": ["contract_type"],
+    },
+)
+
+
 class EmptyLLMResponse(RuntimeError):
     """The model returned no usable text (blocked, truncated, or no candidate at all).
 
@@ -44,6 +95,19 @@ class EmptyLLMResponse(RuntimeError):
     def __init__(self, finish_reason: str = "UNKNOWN"):
         self.finish_reason = finish_reason
         super().__init__(f"Model returned no text (finish_reason={finish_reason})")
+
+
+def _extract_function_call(response: Any, name: str) -> Any:
+    """Returns the args dict of the first `name` function call in the response, or None."""
+    try:
+        parts = response.candidates[0].content.parts or []
+    except Exception:
+        return None
+    for part in parts:
+        fc = getattr(part, "function_call", None)
+        if fc is not None and fc.name == name:
+            return dict(fc.args or {})
+    return None
 
 
 def _finish_reason(response: Any) -> str:
@@ -350,7 +414,8 @@ class GeminiClient:
         
         config = types.GenerateContentConfig(
             temperature=0.3,
-            system_instruction=self.custom_main_prompt or SYSTEM_PROMPT
+            system_instruction=self.custom_main_prompt or SYSTEM_PROMPT,
+            tools=[types.Tool(function_declarations=[GENERATE_CONTRACT_DECLARATION])],
         )
 
         response = await self._generate_with_retry(
@@ -358,6 +423,20 @@ class GeminiClient:
             contents=payload,
             config=config
         )
+
+        # A tool call replaces the text answer entirely — the model handed back
+        # structured intent instead of prose, which is not the EmptyLLMResponse failure
+        # case below; the caller (chat.py) executes it and produces the reply itself.
+        tool_call = _extract_function_call(response, "generate_contract")
+        if tool_call is not None:
+            logger.info(f"🔧 Model requested generate_contract({tool_call})")
+            return {
+                "answer": "",
+                "tool_call": {"name": "generate_contract", "args": tool_call},
+                "model": self.main_model,
+                "context_length": len(context_markdown),
+                "prompt_length": len(final_prompt),
+            }
 
         # response.text is None whenever the model returns no usable candidate (SAFETY,
         # RECITATION, MAX_TOKENS, ...). Calling .strip() on it raised a bare AttributeError

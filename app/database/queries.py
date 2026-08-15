@@ -6,8 +6,9 @@ Rows returned as dicts via RealDictCursor (configured in connection.py).
 """
 import json
 import logging
+import re
 import time
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
 
 from app.database.connection import get_connection, get_transaction, AsyncCursor
@@ -229,6 +230,130 @@ async def fetch_document_parts(part_ids: List[str]) -> List[Dict[str, Any]]:
             "source_url": row["source_url"],
         }
         for row in rows
+    ]
+
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
+)
+
+
+def _doc_meta_row(row) -> Dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "source_doc_id": row["source_doc_id"],
+        "title": row["title"],
+        "act_type": row["act_type"],
+        "doc_date": str(row["doc_date"]) if row["doc_date"] else None,
+        "source_url": row["source_url"],
+        "category": row["category"],
+    }
+
+
+async def resolve_legal_document(key: str) -> Optional[Dict[str, Any]]:
+    """Resolves a citation key (a `source_doc_id`, a `documents.id`, or a stray
+    `document_parts.id` — the panel sometimes only has the latter) to the root
+    document's metadata.
+
+    Tried as separate, short-circuited queries rather than one OR'd/UNION'd query:
+    each branch is then a plain indexed lookup (source_doc_id is UNIQUE, both id
+    columns are primary keys) instead of a query the planner can't use an index for,
+    and the two UUID-keyed branches never even run for the common case of a plain
+    `source_doc_id` string.
+    """
+    meta_cols = "id, source_doc_id, title, act_type, doc_date, source_url, category"
+
+    async with get_connection() as cur:
+        await cur.execute(
+            f"SELECT {meta_cols} FROM documents WHERE source_doc_id = %s LIMIT 1;",
+            (key,),
+        )
+        row = cur.fetchone()
+        if row:
+            return _doc_meta_row(row)
+
+        if not _UUID_RE.match(key):
+            return None
+
+        await cur.execute(
+            f"SELECT {meta_cols} FROM documents WHERE id = %s::uuid LIMIT 1;",
+            (key,),
+        )
+        row = cur.fetchone()
+        if row:
+            return _doc_meta_row(row)
+
+        await cur.execute(
+            f"""
+            SELECT d.id, d.source_doc_id, d.title, d.act_type, d.doc_date, d.source_url, d.category
+            FROM document_parts dp
+            JOIN documents d ON d.id = dp.document_id
+            WHERE dp.id = %s::uuid
+            LIMIT 1;
+            """,
+            (key,),
+        )
+        row = cur.fetchone()
+        return _doc_meta_row(row) if row else None
+
+
+async def fetch_document_parts_page(
+    document_id: str, offset: int, limit: int
+) -> Tuple[List[Dict[str, Any]], int]:
+    """A window of a document's parts, with their full text, plus the total count."""
+    async with get_connection() as cur:
+        await cur.execute(
+            "SELECT COUNT(*) AS n FROM document_parts WHERE document_id = %s::uuid;",
+            (document_id,),
+        )
+        total = cur.fetchone()["n"]
+
+        await cur.execute(
+            """
+            SELECT id, part_title, text, part_index
+            FROM document_parts
+            WHERE document_id = %s::uuid
+            ORDER BY part_index ASC
+            OFFSET %s LIMIT %s;
+            """,
+            (document_id, offset, limit),
+        )
+        rows = cur.fetchall()
+
+    parts = [
+        {
+            "id": str(r["id"]),
+            "part_title": r["part_title"],
+            "text": r["text"],
+            "part_index": r["part_index"],
+        }
+        for r in rows
+    ]
+    return parts, total
+
+
+async def fetch_document_parts_meta(document_id: str) -> List[Dict[str, Any]]:
+    """Part metadata only (no `text`) — the minimap needs positions and relative
+    sizes for every part, but never needs to download a whole legal code to draw dots.
+    """
+    sql = """
+        SELECT id, part_title, part_index, LENGTH(text) AS char_length
+        FROM document_parts
+        WHERE document_id = %s::uuid
+        ORDER BY part_index ASC;
+    """
+    async with get_connection() as cur:
+        await cur.execute(sql, (document_id,))
+        rows = cur.fetchall()
+
+    return [
+        {
+            "id": str(r["id"]),
+            "part_title": r["part_title"],
+            "part_index": r["part_index"],
+            "char_length": r["char_length"],
+        }
+        for r in rows
     ]
 
 
@@ -492,6 +617,46 @@ async def insert_message(
         # Also touch the session
         await cur.execute("UPDATE chat_sessions SET updated_at = NOW() WHERE id = %s::uuid;", (session_id,))
     return str(row["id"])
+
+
+async def import_guest_session(
+    user_id: str, title: str, messages: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Creates a session and inserts a batch of pre-validated messages atomically.
+
+    Callers must have already filtered `attachments` down to document ids the user
+    may read and constrained `role` to a value the `chat_messages` CHECK constraint
+    accepts — this function trusts its input and only owns the transaction boundary,
+    so a bad row can never leave a half-imported session behind.
+    """
+    session_sql = """
+        INSERT INTO chat_sessions (user_id, title)
+        VALUES (%(user_id)s::uuid, %(title)s)
+        RETURNING id, user_id, title, session_summary, is_pinned, created_at, updated_at;
+    """
+    message_sql = """
+        INSERT INTO chat_messages (session_id, role, content, attachments, sources)
+        VALUES (%(session_id)s::uuid, %(role)s, %(content)s, %(attachments)s::jsonb, %(sources)s::jsonb);
+    """
+
+    async with get_transaction() as cur:
+        await cur.execute(session_sql, {"user_id": user_id, "title": title})
+        session_row = cur.fetchone()
+        session_id = str(session_row["id"])
+
+        if messages:
+            await cur.executemany(message_sql, [
+                {
+                    "session_id": session_id,
+                    "role": m["role"],
+                    "content": m["content"],
+                    "attachments": json.dumps(m["attachments"]) if m.get("attachments") else None,
+                    "sources": json.dumps(m["sources"]) if m.get("sources") else None,
+                }
+                for m in messages
+            ])
+
+    return _session_row(session_row)
 
 
 def _maybe_json(value: Any) -> Any:

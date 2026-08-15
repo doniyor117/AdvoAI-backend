@@ -48,5 +48,5 @@ aioboto3
 python-docx
 # Renders contracts to PDF from HTML/CSS in-process (no Chromium, no sidecar).
 # Needs system libs installed in the Dockerfile: libpango, libpangocairo, libcairo,
-# libgdk-pixbuf.
+# libgdk-pixbuf-2.0.
 weasyprint

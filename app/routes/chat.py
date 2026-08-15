@@ -10,9 +10,12 @@ import logging
 import os
 import tempfile
 import asyncio
+import mimetypes
 from typing import Optional, Dict, Any, List
 
 from fastapi import APIRouter, HTTPException, Depends, Request, BackgroundTasks, UploadFile, File
+from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 
 from app.services.rag_pipeline import retrieve_context
@@ -993,6 +996,49 @@ async def ask_advoai(
         await _rollback_user_message(locals().get("user_message_id"))
         logger.exception("Chat API error")
         raise HTTPException(status_code=500, detail="An error occurred while processing your request.")
+
+
+@router.get("/file/{s3_key:path}/raw")
+async def get_attachment_raw(s3_key: str, request: Request):
+    """
+    Streams the actual file bytes through this backend, rather than redirecting to
+    an R2 presigned URL.
+
+    R2 buckets have no CORS policy by default, which blocks the browser's `fetch()`
+    (used by DocxViewer to get a Blob to render, and by the frontend's forced-download
+    helper) even though a plain `<a href>`/`<iframe src>` navigation to the same URL
+    works fine — navigation isn't subject to CORS, `fetch()` is. Proxying through our
+    own API sidesteps needing to configure bucket-level CORS at all, since this
+    backend's CORS is already correctly set up for the frontend's origin.
+
+    Registered BEFORE the sibling `/file/{s3_key:path}` route below: that route's
+    `:path` converter is greedy and matches slashes too, so if it were registered
+    first it would swallow the trailing `/raw` as part of `s3_key` and this route
+    would never be reached. Route order is match order in FastAPI/Starlette.
+    """
+    user = await get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required.")
+
+    tmp_path = await download_file_from_s3(s3_key)
+    if not tmp_path:
+        raise HTTPException(status_code=404, detail="File not found or storage is not configured.")
+
+    filename = s3_key.split("_", 1)[-1] if "_" in s3_key else s3_key
+    mime_type, _ = mimetypes.guess_type(filename)
+
+    def _cleanup():
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+    return FileResponse(
+        tmp_path,
+        media_type=mime_type or "application/octet-stream",
+        filename=filename,
+        background=BackgroundTask(_cleanup),
+    )
 
 
 @router.get("/file/{s3_key:path}")
